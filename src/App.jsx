@@ -5,6 +5,7 @@ import {
   CheckCircle,
   CircleNotch,
   CloudArrowUp,
+  DownloadSimple,
   Eye,
   EyeSlash,
   GearSix,
@@ -27,19 +28,25 @@ const DEFAULT_CONFIG = {
   provider: "OpenAI Compatible",
   baseUrl: "https://api.openai.com/v1",
   model: "gpt-4.1-mini",
+  cachedModels: [],
+  modelsLastFetchedAt: "",
   apiKey: "",
   apiKeyConfigured: false,
   imageEnabled: false,
   imageProtocol: "chat-completions",
   imageBaseUrl: "",
   imageModel: "",
+  cachedImageModels: [],
+  imageModelsLastFetchedAt: "",
   imageApiKey: "",
   imageApiKeyConfigured: false,
-  imageReuseChatKey: true,
+  imageReuseChatKey: false,
   autoStartBridge: true,
   bridgePort: 8787,
   officialGateway: "https://phoenix-gw.alibaba.com",
   accioPath: "C:\\Users\\123\\AppData\\Local\\Programs\\Accio\\Accio.exe",
+  updateFeedUrl: "",
+  updateCheckOnStart: false,
 };
 
 const DEMO_LOGS = [
@@ -71,6 +78,30 @@ async function invoke(command, args = {}) {
     if (command === "test_endpoint") {
       return { ok: true, latencyMs: 312, modelFound: true, message: "Endpoint reachable" };
     }
+    if (command === "fetch_models") {
+      return {
+        models: [
+          { id: "gpt-5.5", displayName: "gpt-5.5", ownedBy: "NewAPI" },
+          { id: "gpt-4.1-mini", displayName: "gpt-4.1-mini", ownedBy: "NewAPI" },
+        ],
+        selectedModel: "gpt-5.5",
+        fetchedAt: new Date().toISOString(),
+      };
+    }
+    if (command === "fetch_image_models") {
+      return {
+        models: [
+          { id: "gpt-image-1", displayName: "gpt-image-1", ownedBy: "NewAPI" },
+          { id: "dall-e-3", displayName: "dall-e-3", ownedBy: "NewAPI" },
+        ],
+        selectedModel: "gpt-image-1",
+        fetchedAt: new Date().toISOString(),
+      };
+    }
+    if (command === "check_update") {
+      return { currentVersion: "0.3.0", hasUpdate: false, version: "0.3.0", notes: "No update available" };
+    }
+    if (command === "download_update") return { downloaded: true, filePath: "C:\\Temp\\Accio-Switch-0.3.0.exe", version: "0.3.0" };
     if (command === "start_bridge") return { running: true };
     if (command === "stop_bridge") return { running: false };
     if (command === "launch_accio") return { launched: true, message: "Accio Work launched" };
@@ -107,15 +138,28 @@ export function App() {
   const [busy, setBusy] = useState("");
   const [testResult, setTestResult] = useState(null);
   const [imageTestResult, setImageTestResult] = useState(null);
+  const [modelFetchResult, setModelFetchResult] = useState(null);
+  const [imageModelFetchResult, setImageModelFetchResult] = useState(null);
+  const [updateResult, setUpdateResult] = useState(null);
   const [notice, setNotice] = useState("");
   const [activeNav, setActiveNav] = useState("route");
+  const [appVersion, setAppVersion] = useState("0.2.9");
 
   useEffect(() => {
     invoke("get_snapshot")
       .then((snapshot) => {
         setConfig({ ...DEFAULT_CONFIG, ...snapshot.config, apiKey: "" });
         setBridgeRunning(snapshot.bridgeRunning);
+        if (snapshot.appVersion) setAppVersion(snapshot.appVersion);
         if (snapshot.logs?.length) setLogs(snapshot.logs.slice(-8));
+        if (snapshot.config?.updateCheckOnStart && snapshot.config?.updateFeedUrl) {
+          invoke("check_update", { feedUrl: snapshot.config.updateFeedUrl })
+            .then((result) => {
+              setUpdateResult(result);
+              if (result.hasUpdate) setNotice(`New version available: ${result.version}`);
+            })
+            .catch(() => {});
+        }
       })
       .catch((error) => setNotice(String(error)));
   }, []);
@@ -123,7 +167,16 @@ export function App() {
   const update = (patch) => {
     setConfig((current) => ({ ...current, ...patch }));
     setTestResult(null);
+    if (Object.hasOwn(patch, "baseUrl") || Object.hasOwn(patch, "apiKey")) {
+      setModelFetchResult(null);
+      setImageModelFetchResult(null);
+    }
+    if (Object.hasOwn(patch, "imageBaseUrl") || Object.hasOwn(patch, "imageApiKey") || Object.hasOwn(patch, "imageReuseChatKey")) {
+      setImageModelFetchResult(null);
+    }
   };
+
+  const looksLikeApiKey = (value = "") => /^sk-[A-Za-z0-9_-]{16,}/.test(String(value).trim());
 
   const selectedProvider = useMemo(
     () => providers.find((item) => item.label === config.provider) || providers[0],
@@ -190,6 +243,108 @@ export function App() {
     }
   };
 
+  const fetchModels = async () => {
+    setBusy("models");
+    setNotice("");
+    try {
+      await invoke("save_config", { config });
+      const result = await invoke("fetch_models");
+      setModelFetchResult(result);
+      setConfig((current) => ({
+        ...current,
+        cachedModels: result.models || [],
+        modelsLastFetchedAt: result.fetchedAt || "",
+        model: result.selectedModel || current.model,
+        apiKey: "",
+        apiKeyConfigured: current.apiKeyConfigured || Boolean(current.apiKey),
+      }));
+      addLog(`Fetched ${(result.models || []).length} upstream model(s)`);
+      setNotice(`Fetched ${(result.models || []).length} upstream model(s)`);
+    } catch (error) {
+      const message = String(error);
+      setModelFetchResult({ error: message, models: [] });
+      setNotice(message);
+      addLog(message, "ERROR");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const fetchImageModels = async () => {
+    setBusy("image-models");
+    setNotice("");
+    try {
+      await invoke("save_config", { config });
+      const result = await invoke("fetch_image_models");
+      setImageModelFetchResult(result);
+      setConfig((current) => ({
+        ...current,
+        cachedImageModels: result.models || [],
+        imageModelsLastFetchedAt: result.fetchedAt || "",
+        imageModel: result.selectedModel || current.imageModel,
+        apiKey: "",
+        imageApiKey: "",
+        apiKeyConfigured: current.apiKeyConfigured || Boolean(current.apiKey),
+        imageApiKeyConfigured: current.imageApiKeyConfigured || Boolean(current.imageApiKey),
+      }));
+      addLog(`Fetched ${(result.models || []).length} upstream image model(s)`);
+      setNotice(`Fetched ${(result.models || []).length} upstream image model(s)`);
+    } catch (error) {
+      const message = String(error);
+      setImageModelFetchResult({ error: message, models: [] });
+      setNotice(message);
+      addLog(message, "ERROR");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const checkUpdate = async () => {
+    setBusy("update-check");
+    setNotice("");
+    try {
+      await invoke("save_config", { config });
+      const result = await invoke("check_update", { feedUrl: config.updateFeedUrl });
+      setUpdateResult(result);
+      addLog(result.hasUpdate ? `Update available: ${result.version}` : "No update available");
+      setNotice(result.hasUpdate ? `New version available: ${result.version}` : "Already up to date");
+    } catch (error) {
+      setNotice(String(error));
+      addLog(String(error), "ERROR");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const downloadUpdate = async () => {
+    setBusy("update-download");
+    setNotice("");
+    try {
+      await invoke("save_config", { config });
+      const result = await invoke("download_update", { feedUrl: config.updateFeedUrl });
+      setUpdateResult(result);
+      addLog(result.downloaded ? `Downloaded update ${result.version}` : "No update to download");
+      setNotice(result.downloaded ? `Downloaded ${result.version}` : "Already up to date");
+    } catch (error) {
+      setNotice(String(error));
+      addLog(String(error), "ERROR");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const installUpdate = async () => {
+    if (!updateResult?.filePath) return;
+    setBusy("update-install");
+    try {
+      await invoke("install_update", { filePath: updateResult.filePath });
+    } catch (error) {
+      setNotice(String(error));
+      addLog(String(error), "ERROR");
+      setBusy("");
+    }
+  };
+
   const toggleBridge = async () => {
     setBusy("bridge");
     setNotice("");
@@ -228,10 +383,11 @@ export function App() {
     { label: "Custom endpoint", value: testResult?.ok ? `${testResult.latencyMs} ms` : "Not tested", ok: Boolean(testResult?.ok) },
     { label: "Authentication", value: config.apiKey || config.apiKeyConfigured ? "Key configured" : "Missing key", ok: Boolean(config.apiKey || config.apiKeyConfigured) },
     { label: "Chat model", value: config.model || "Not set", ok: Boolean(config.model) },
+    { label: "Model list", value: config.cachedModels?.length ? `${config.cachedModels.length} cached` : "Manual", ok: true },
     {
       label: "Image route",
-      value: config.imageEnabled ? (config.imageModel || config.model || "Not set") : "Disabled",
-      ok: !config.imageEnabled || Boolean(config.imageModel || config.model),
+      value: config.imageEnabled ? (config.imageModel || "Not set") : "Disabled",
+      ok: !config.imageEnabled || (Boolean(config.imageModel) && !looksLikeApiKey(config.imageModel)),
     },
   ];
 
@@ -254,7 +410,7 @@ export function App() {
         </nav>
         <div className="sidebar-foot">
           <div><StatusDot status={bridgeRunning ? "good" : "idle"} />Bridge</div>
-          <small>v0.2.8</small>
+          <small>v{appVersion}</small>
         </div>
       </aside>
 
@@ -343,12 +499,25 @@ export function App() {
                       <label>
                         <span>Model</span>
                         <div className="input-wrap mono">
-                          <input value={config.model} onChange={(event) => update({ model: event.target.value })} disabled={config.mode === "official"} />
+                          {config.cachedModels?.length ? (
+                            <select value={config.model} onChange={(event) => update({ model: event.target.value })} disabled={config.mode === "official"}>
+                              {config.cachedModels.map((model) => (
+                                <option key={model.id || model} value={model.id || model}>{model.displayName || model.id || model}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input value={config.model} onChange={(event) => update({ model: event.target.value })} disabled={config.mode === "official"} />
+                          )}
                           <CaretDown size={16} />
                         </div>
+                        <small>{config.modelsLastFetchedAt ? `Fetched ${config.cachedModels?.length || 0} model(s) from upstream.` : "Fetch models from NewAPI/OpenAI-compatible /models, or type manually."}</small>
                       </label>
                     </div>
                     <div className="endpoint-actions">
+                      <button className="outline-button" onClick={fetchModels} disabled={busy || config.mode === "official"}>
+                        {busy === "models" ? <CircleNotch className="spin" size={17} /> : <CloudArrowUp size={17} />}
+                        Fetch models
+                      </button>
                       <button className="outline-button" onClick={testEndpoint} disabled={busy || config.mode === "official"}>
                         {busy === "test" ? <CircleNotch className="spin" size={17} /> : <SlidersHorizontal size={17} />}
                         Test endpoint
@@ -359,6 +528,7 @@ export function App() {
                           {testResult.ok ? `Success (${testResult.latencyMs} ms)` : testResult.message}
                         </span>
                       )}
+                      {modelFetchResult?.error && <span className="test-error"><XCircle size={18} weight="fill" />{modelFetchResult.error}</span>}
                     </div>
                   </div>
                 </section>
@@ -400,19 +570,34 @@ export function App() {
                         <label>
                           <span>Image model</span>
                           <div className="input-wrap mono">
-                            <input
-                              value={config.imageModel}
-                              placeholder={config.model || "image-model"}
-                              onChange={(event) => update({ imageModel: event.target.value })}
-                              disabled={!config.imageEnabled}
-                            />
+                            {config.cachedImageModels?.length ? (
+                              <select
+                                value={config.imageModel || config.cachedImageModels[0]?.id || ""}
+                                onChange={(event) => update({ imageModel: event.target.value })}
+                                disabled={!config.imageEnabled}
+                              >
+                                {config.cachedImageModels.map((model) => (
+                                  <option key={model.id || model} value={model.id || model}>{model.displayName || model.id || model}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <input
+                                value={config.imageModel}
+                                placeholder="image-capable-model"
+                                onChange={(event) => update({ imageModel: event.target.value })}
+                                disabled={!config.imageEnabled}
+                              />
+                            )}
                           </div>
-                          <small>Leave empty to reuse the chat model.</small>
+                          <small>{config.imageModelsLastFetchedAt ? `Fetched ${config.cachedImageModels?.length || 0} image model(s) from upstream.` : "Required. Pick an image-capable model; chat model is not reused automatically."}</small>
+                          {looksLikeApiKey(config.imageModel) && (
+                            <small className="field-warning">This looks like an API key. Put it in API key, not Image model.</small>
+                          )}
                         </label>
                       </div>
                       <div className="behavior-list compact-behavior">
                         <div>
-                          <span><strong>Reuse chat API key</strong><small>Turn off to store a separate encrypted key for image requests.</small></span>
+                          <span><strong>Reuse chat API key</strong><small>Optional. Keep off when your image provider or quota uses a separate key.</small></span>
                           <Toggle checked={config.imageReuseChatKey} onChange={(value) => update({ imageReuseChatKey: value })} label="Reuse chat API key" />
                         </div>
                       </div>
@@ -437,6 +622,10 @@ export function App() {
                         </div>
                       )}
                       <div className="endpoint-actions">
+                        <button className="outline-button" onClick={fetchImageModels} disabled={busy || !config.imageEnabled}>
+                          {busy === "image-models" ? <CircleNotch className="spin" size={17} /> : <CloudArrowUp size={17} />}
+                          Fetch image models
+                        </button>
                         <button className="outline-button" onClick={testImageEndpoint} disabled={busy || !config.imageEnabled}>
                           {busy === "image-test" ? <CircleNotch className="spin" size={17} /> : <SlidersHorizontal size={17} />}
                           Test image endpoint
@@ -447,6 +636,7 @@ export function App() {
                             {imageTestResult.ok ? `Success (${imageTestResult.latencyMs} ms)` : imageTestResult.message}
                           </span>
                         )}
+                        {imageModelFetchResult?.error && <span className="test-error"><XCircle size={18} weight="fill" />{imageModelFetchResult.error}</span>}
                       </div>
                     </div>
                   </div>
@@ -544,6 +734,13 @@ export function App() {
             <label><span>Bridge port</span><input type="number" value={config.bridgePort} onChange={(event) => update({ bridgePort: Number(event.target.value) })} /></label>
             <label><span>Official gateway</span><input value={config.officialGateway} onChange={(event) => update({ officialGateway: event.target.value })} /></label>
             <label><span>Accio executable</span><input value={config.accioPath} onChange={(event) => update({ accioPath: event.target.value })} /></label>
+            <label><span>Update feed URL</span><input value={config.updateFeedUrl} placeholder="https://cdn.example.com/accio-switch/latest.json" onChange={(event) => update({ updateFeedUrl: event.target.value })} /></label>
+            <div className="behavior-list settings-toggle-row">
+              <div>
+                <span><strong>Check for updates on start</strong><small>Reads a static latest.json feed. Update packages should be public or signed by checksum.</small></span>
+                <Toggle checked={config.updateCheckOnStart} onChange={(value) => update({ updateCheckOnStart: value })} label="Check updates on start" />
+              </div>
+            </div>
             <button className="launch-button" onClick={save}>Save settings</button>
           </div>
         )}
@@ -552,7 +749,35 @@ export function App() {
           <div className="single-page about-page">
             <ShareNetwork size={52} weight="duotone" />
             <h2>Accio Switch</h2>
+            <p className="version-line">Current version: <code>v{appVersion}</code></p>
             <p>A local routing companion for Accio Work. It keeps official services intact while redirecting supported LLM traffic through your chosen OpenAI-compatible endpoint.</p>
+            <section className="update-card">
+              <h3>Updates</h3>
+              <p>Use a static <code>latest.json</code> feed for portable exe updates. The app downloads the new exe and verifies sha256 before launching it.</p>
+              <div className="endpoint-actions">
+                <button className="outline-button" onClick={checkUpdate} disabled={busy || !config.updateFeedUrl}>
+                  {busy === "update-check" ? <CircleNotch className="spin" size={17} /> : <SlidersHorizontal size={17} />}
+                  Check update
+                </button>
+                <button className="outline-button" onClick={downloadUpdate} disabled={busy || !config.updateFeedUrl || updateResult?.hasUpdate === false}>
+                  {busy === "update-download" ? <CircleNotch className="spin" size={17} /> : <DownloadSimple size={17} />}
+                  Download
+                </button>
+                {updateResult?.filePath && (
+                  <button className="launch-button" onClick={installUpdate} disabled={busy}>
+                    {busy === "update-install" ? <CircleNotch className="spin" size={17} /> : <Play size={17} weight="fill" />}
+                    Launch update
+                  </button>
+                )}
+              </div>
+              {updateResult && (
+                <div className={`update-result ${updateResult.hasUpdate ? "has-update" : ""}`}>
+                  <strong>{updateResult.hasUpdate ? `Version ${updateResult.version} available` : "Already up to date"}</strong>
+                  <small>{updateResult.notes || `Current version: ${updateResult.currentVersion || appVersion}`}</small>
+                  {updateResult.filePath && <code>{updateResult.filePath}</code>}
+                </div>
+              )}
+            </section>
             <div className="notice-box"><Warning size={20} weight="fill" /><span>In Custom mode, chat and image-model requests never fall back to Accio's official model service. Non-model account and application APIs remain transparently proxied so Accio Work can operate.</span></div>
           </div>
         )}

@@ -1,10 +1,12 @@
-const { app, BrowserWindow, ipcMain, safeStorage } = require("electron");
+const { app, BrowserWindow, ipcMain, safeStorage, shell } = require("electron");
 const { execFile, spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const { promisify } = require("node:util");
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const { Readable } = require("node:stream");
+const packageInfo = require("../package.json");
 const {
   accioToOpenAI,
   buildToolRepairRequest,
@@ -23,19 +25,25 @@ const DEFAULT_CONFIG = {
   provider: "OpenAI Compatible",
   baseUrl: "https://api.openai.com/v1",
   model: "gpt-4.1-mini",
+  cachedModels: [],
+  modelsLastFetchedAt: "",
   apiKey: "",
   apiKeyConfigured: false,
   imageEnabled: false,
   imageProtocol: "chat-completions",
   imageBaseUrl: "",
   imageModel: "",
+  cachedImageModels: [],
+  imageModelsLastFetchedAt: "",
   imageApiKey: "",
   imageApiKeyConfigured: false,
-  imageReuseChatKey: true,
+  imageReuseChatKey: false,
   autoStartBridge: true,
   bridgePort: 8787,
   officialGateway: "https://phoenix-gw.alibaba.com",
   accioPath: path.join(process.env.LOCALAPPDATA || "", "Programs", "Accio", "Accio.exe"),
+  updateFeedUrl: "",
+  updateCheckOnStart: false,
 };
 
 let config = { ...DEFAULT_CONFIG };
@@ -67,6 +75,7 @@ function storagePaths() {
     key: path.join(root, "provider-key.bin"),
     imageKey: path.join(root, "image-provider-key.bin"),
     log: path.join(root, "bridge.log"),
+    updates: path.join(root, "updates"),
   };
 }
 
@@ -151,28 +160,145 @@ async function readBody(req) {
 }
 
 function modelList() {
+  const configuredModels = Array.isArray(config.cachedModels) && config.cachedModels.length
+    ? config.cachedModels
+    : [{ id: config.model, displayName: config.model }];
+  const models = configuredModels
+    .map((model) => (typeof model === "string" ? { id: model, displayName: model } : model))
+    .filter((model) => model?.id);
+
   return [{
     provider: "accio-switch",
     providerDisplayName: "Accio Switch",
-    modelList: [{
-      modelCode: config.model,
-      modelName: config.model,
-      modelDisplayName: config.model,
-      modelDesc: `${config.model} via ${config.provider}`,
+    modelList: models.map((model) => ({
+      modelCode: model.id,
+      modelName: model.id,
+      modelDisplayName: model.displayName || model.id,
+      modelDesc: model.ownedBy ? `${model.id} via ${model.ownedBy}` : `${model.id} via ${config.provider}`,
       visible: true,
-      isDefault: true,
+      isDefault: model.id === config.model,
       freeUse: true,
       multimodal: true,
       contextWindow: 128000,
       reasoningEfforts: ["low", "medium", "high"],
       defaultReasoningEffort: "medium",
-    }],
+    })),
   }];
+}
+
+function normalizedBaseUrl(value = "") {
+  return String(value || "").replace(/\/$/, "");
+}
+
+async function fetchProviderModels() {
+  if (!apiKey) throw new Error("Configure an API key first");
+  if (!config.baseUrl) throw new Error("Configure a Base URL first");
+  const started = Date.now();
+  const response = await fetch(`${normalizedBaseUrl(config.baseUrl)}/models`, {
+    headers: { authorization: `Bearer ${apiKey}` },
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(`Model list response parse failed: ${text.slice(0, 240)}`);
+  }
+  if (!response.ok) {
+    throw new Error(`Model list HTTP ${response.status}: ${payload?.error?.message || payload?.message || text.slice(0, 240)}`);
+  }
+  const rawModels = Array.isArray(payload?.data) ? payload.data : [];
+  const seen = new Set();
+  const models = rawModels
+    .map((item) => ({
+      id: item?.id || item?.model || item?.name,
+      displayName: item?.id || item?.model || item?.name,
+      ownedBy: item?.owned_by || item?.ownedBy || item?.provider || "",
+    }))
+    .filter((model) => model.id && !seen.has(model.id) && seen.add(model.id))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  if (!models.length) throw new Error("Model list endpoint returned no models");
+  const selectedExists = models.some((model) => model.id === config.model);
+  config.cachedModels = models;
+  config.modelsLastFetchedAt = new Date().toISOString();
+  if (!config.model || !selectedExists) config.model = models[0].id;
+  saveConfig({});
+  log("INFO", `Fetched ${models.length} upstream model(s) in ${Date.now() - started} ms`);
+  return {
+    models,
+    selectedModel: config.model,
+    fetchedAt: config.modelsLastFetchedAt,
+  };
+}
+
+function looksLikeApiKey(value = "") {
+  return /^sk-[A-Za-z0-9_-]{16,}/.test(String(value).trim());
+}
+
+function imageModelValue() {
+  const model = String(config.imageModel || "").trim();
+  if (looksLikeApiKey(model)) {
+    throw new Error("Image model looks like an API key. Put the key in API key, and choose a real image model name.");
+  }
+  if (!model) {
+    throw new Error("Image model is not configured. Choose an image-capable model; chat models are not reused automatically.");
+  }
+  return model;
+}
+
+async function fetchImageProviderModels() {
+  const key = config.imageReuseChatKey ? apiKey : imageApiKey;
+  if (!key) throw new Error("Configure an image API key first");
+  const baseUrl = normalizedBaseUrl(config.imageBaseUrl || config.baseUrl);
+  if (!baseUrl) throw new Error("Configure an image Base URL first");
+  const started = Date.now();
+  const response = await fetch(`${baseUrl}/models`, {
+    headers: { authorization: `Bearer ${key}` },
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(`Image model list response parse failed: ${text.slice(0, 240)}`);
+  }
+  if (!response.ok) {
+    throw new Error(`Image model list HTTP ${response.status}: ${payload?.error?.message || payload?.message || text.slice(0, 240)}`);
+  }
+  const rawModels = Array.isArray(payload?.data) ? payload.data : [];
+  const seen = new Set();
+  const models = rawModels
+    .map((item) => ({
+      id: item?.id || item?.model || item?.name,
+      displayName: item?.id || item?.model || item?.name,
+      ownedBy: item?.owned_by || item?.ownedBy || item?.provider || "",
+    }))
+    .filter((model) => model.id && !seen.has(model.id) && seen.add(model.id))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  if (!models.length) throw new Error("Image model list endpoint returned no models");
+  const selected = (() => {
+    try {
+      return imageModelValue();
+    } catch {
+      return "";
+    }
+  })();
+  const selectedExists = models.some((model) => model.id === selected);
+  config.cachedImageModels = models;
+  config.imageModelsLastFetchedAt = new Date().toISOString();
+  if (!selected || !selectedExists) config.imageModel = models[0].id;
+  saveConfig({});
+  log("INFO", `Fetched ${models.length} upstream image model(s) in ${Date.now() - started} ms`);
+  return {
+    models,
+    selectedModel: config.imageModel,
+    fetchedAt: config.imageModelsLastFetchedAt,
+  };
 }
 
 async function requestProvider(providerRequest) {
   const requestBody = JSON.stringify(providerRequest);
-  const url = `${config.baseUrl.replace(/\/$/, "")}/chat/completions`;
+  const url = `${normalizedBaseUrl(config.baseUrl)}/chat/completions`;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     const response = await fetch(url, {
       method: "POST",
@@ -337,10 +463,86 @@ async function callCustomLLM(input) {
 
 function imageCredentials() {
   return {
-    baseUrl: (config.imageBaseUrl || config.baseUrl).replace(/\/$/, ""),
-    model: config.imageModel || config.model,
+    baseUrl: normalizedBaseUrl(config.imageBaseUrl || config.baseUrl),
+    model: imageModelValue(),
     key: config.imageReuseChatKey ? apiKey : imageApiKey,
   };
+}
+
+function compareVersions(a = "", b = "") {
+  const left = String(a).replace(/^v/i, "").split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+  const right = String(b).replace(/^v/i, "").split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    if ((left[index] || 0) > (right[index] || 0)) return 1;
+    if ((left[index] || 0) < (right[index] || 0)) return -1;
+  }
+  return 0;
+}
+
+async function checkForUpdate(feedUrl = config.updateFeedUrl) {
+  if (!feedUrl) throw new Error("Configure an update feed URL first");
+  const response = await fetch(`${feedUrl}${feedUrl.includes("?") ? "&" : "?"}t=${Date.now()}`, {
+    headers: { accept: "application/json" },
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(`Update feed parse failed: ${text.slice(0, 240)}`);
+  }
+  if (!response.ok) throw new Error(`Update feed HTTP ${response.status}: ${payload?.message || text.slice(0, 240)}`);
+  if (!payload?.version || !payload?.url) throw new Error("Update feed must include version and url");
+  const hasUpdate = compareVersions(payload.version, packageInfo.version) > 0;
+  const belowMinimum = payload.minVersion ? compareVersions(packageInfo.version, payload.minVersion) < 0 : false;
+  return {
+    currentVersion: packageInfo.version,
+    hasUpdate,
+    mandatory: Boolean(payload.mandatory || belowMinimum),
+    version: payload.version,
+    channel: payload.channel || "stable",
+    url: payload.url,
+    sha256: payload.sha256 || "",
+    notes: payload.notes || payload.changelog || "",
+    minVersion: payload.minVersion || "",
+  };
+}
+
+async function downloadUpdate(feedUrl = config.updateFeedUrl) {
+  const update = await checkForUpdate(feedUrl);
+  if (!update.hasUpdate) return { ...update, downloaded: false };
+  const response = await fetch(update.url);
+  if (!response.ok) throw new Error(`Update download HTTP ${response.status}`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+  if (update.sha256 && sha256.toLowerCase() !== update.sha256.toLowerCase()) {
+    throw new Error(`Update checksum mismatch: expected ${update.sha256}, got ${sha256}`);
+  }
+  const updatesDir = storagePaths().updates;
+  fs.mkdirSync(updatesDir, { recursive: true });
+  const fileName = path.basename(new URL(update.url).pathname) || `Accio-Switch-${update.version}.exe`;
+  const filePath = path.join(updatesDir, fileName);
+  fs.writeFileSync(filePath, bytes);
+  log("INFO", `Downloaded update ${update.version} to ${filePath}`);
+  return {
+    ...update,
+    downloaded: true,
+    filePath,
+    sha256,
+    size: bytes.length,
+  };
+}
+
+function launchDownloadedUpdate(filePath) {
+  const updatesDir = path.resolve(storagePaths().updates);
+  const resolved = path.resolve(filePath || "");
+  if (!resolved.startsWith(updatesDir + path.sep)) throw new Error("Update file is outside the updates directory");
+  if (!fs.existsSync(resolved)) throw new Error(`Update file not found: ${resolved}`);
+  spawn(resolved, [], { detached: true, stdio: "ignore", windowsHide: false }).unref();
+  log("INFO", `Launching downloaded update: ${path.basename(resolved)}`);
+  setTimeout(() => app.quit(), 500);
+  return { launched: true };
 }
 
 async function fetchImageAsBase64(url, authorization) {
@@ -456,7 +658,6 @@ async function callOpenAIImages(input, credentials) {
     form.set("model", credentials.model);
     form.set("prompt", imageRequest.prompt);
     form.set("size", imageSizeForOpenAI(imageRequest.aspectRatio));
-    form.set("response_format", "b64_json");
     for (const [index, image] of imageRequest.images.entries()) {
       const bytes = await resolveImageInput(image, authorization);
       form.append("image", new Blob([bytes], { type: image.mimeType }), `reference-${index}.png`);
@@ -475,7 +676,6 @@ async function callOpenAIImages(input, credentials) {
         prompt: imageRequest.prompt,
         n: 1,
         size: imageSizeForOpenAI(imageRequest.aspectRatio),
-        response_format: "b64_json",
       }),
     });
   }
@@ -497,7 +697,7 @@ async function callCustomImage(input) {
   if (!credentials.key) throw new Error("Image API key is not configured");
   if (!credentials.model) throw new Error("Image model is not configured");
   const started = Date.now();
-  log("INFO", `Image request: model=${credentials.model}, protocol=${config.imageProtocol}`);
+  log("INFO", `Image request: model=${looksLikeApiKey(credentials.model) ? "sk-[redacted]" : credentials.model}, protocol=${config.imageProtocol}`);
   const result = config.imageProtocol === "openai-images"
     ? await callOpenAIImages(input, credentials)
     : await callChatImage(input, credentials);
@@ -588,6 +788,7 @@ function registerIpc() {
     },
     bridgeRunning: Boolean(bridgeServer),
     accioRunning: await isAccioRunning(),
+    appVersion: packageInfo.version,
     logs,
   }));
   ipcMain.handle("accio-switch:save_config", (_event, { config: next }) => {
@@ -626,6 +827,16 @@ function registerIpc() {
       throw error;
     }
   });
+  ipcMain.handle("accio-switch:fetch_models", async () => fetchProviderModels());
+  ipcMain.handle("accio-switch:fetch_image_models", async () => fetchImageProviderModels());
+  ipcMain.handle("accio-switch:check_update", async (_event, { feedUrl } = {}) => checkForUpdate(feedUrl || config.updateFeedUrl));
+  ipcMain.handle("accio-switch:download_update", async (_event, { feedUrl } = {}) => downloadUpdate(feedUrl || config.updateFeedUrl));
+  ipcMain.handle("accio-switch:open_update_file", async (_event, { filePath } = {}) => {
+    if (!filePath) throw new Error("No update file path provided");
+    await shell.showItemInFolder(filePath);
+    return { ok: true };
+  });
+  ipcMain.handle("accio-switch:install_update", async (_event, { filePath } = {}) => launchDownloadedUpdate(filePath));
   ipcMain.handle("accio-switch:test_image_endpoint", async () => {
     const credentials = imageCredentials();
     if (!credentials.key) throw new Error("Configure an image API key first");
@@ -634,12 +845,24 @@ function registerIpc() {
       headers: { authorization: `Bearer ${credentials.key}` },
     });
     const text = await response.text();
+    let payload = null;
+    try {
+      payload = JSON.parse(text);
+    } catch {}
+    const models = Array.isArray(payload?.data) ? payload.data.map((item) => item?.id || item?.model || item?.name).filter(Boolean) : [];
+    const modelFound = models.length ? models.includes(credentials.model) : text.includes(credentials.model);
     const result = {
       ok: response.ok,
       latencyMs: Date.now() - started,
-      modelFound: text.includes(credentials.model),
-      message: response.ok ? "Image endpoint reachable" : `Image endpoint returned HTTP ${response.status}`,
+      modelFound,
+      models,
+      message: response.ok && modelFound
+        ? "Image endpoint reachable"
+        : response.ok
+          ? `Image endpoint reachable, but model '${credentials.model}' was not found`
+          : `Image endpoint returned HTTP ${response.status}: ${payload?.error?.message || payload?.message || text.slice(0, 240)}`,
     };
+    result.ok = result.ok && result.modelFound;
     log(result.ok ? "INFO" : "ERROR", `Image endpoint test: ${result.message}`);
     return result;
   });

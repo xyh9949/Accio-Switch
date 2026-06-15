@@ -15,12 +15,17 @@ Build the portable Windows executable:
 npm run electron:build
 ```
 
-The packaged executable is written to `release/Accio-Switch-0.2.9.exe`.
+The packaged executable is written to `release/Accio-Switch-0.3.3.exe`.
 
 ## Current compatibility
 
 - Accio Work 0.16.0 model-list injection
 - OpenAI-compatible `/v1/models`
+- Upstream model discovery through OpenAI-compatible `/v1/models`
+- Separate upstream image-model discovery and validation
+- Independent image model and image API key configuration
+- NewAPI-compatible Images API requests without legacy `response_format`
+- Static `latest.json` update checks for portable Windows builds
 - OpenAI-compatible `/v1/chat/completions`
 - Accio ADK SSE response frames
 - JSON and SSE provider responses

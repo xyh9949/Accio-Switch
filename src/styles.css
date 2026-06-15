@@ -78,6 +78,7 @@ button:disabled { opacity: .52; cursor: not-allowed; }
 .form-grid { display: grid; gap: 11px; max-width: 560px; }
 .form-grid label > span, .settings-page label > span { display: block; margin-bottom: 5px; font-size: 14px; font-weight: 600; }
 .form-grid label > small { display: block; color: #7a818b; margin-top: 4px; font-size: 11px; }
+.form-grid label > small.field-warning { color: var(--red); font-weight: 600; }
 code, .mono { font-family: "JetBrains Mono", monospace; }
 .input-wrap { min-height: 36px; padding: 0 11px; display: flex; align-items: center; gap: 9px; border: 1px solid #cfd3d5; border-radius: 6px; background: white; color: #5d6670; }
 .input-wrap:focus-within { border-color: #3883dc; box-shadow: 0 0 0 3px rgba(56,131,220,.1); }
@@ -146,7 +147,17 @@ code, .mono { font-family: "JetBrains Mono", monospace; }
 .settings-page { max-width: 800px; }
 .settings-page label { display: block; margin-bottom: 20px; }
 .settings-page input { width: 100%; height: 43px; padding: 0 12px; border: 1px solid var(--line); border-radius: 6px; background: white; font: 13px "JetBrains Mono", monospace; }
+.settings-toggle-row { margin: 0 0 22px; }
 .about-page { max-width: 720px; }.about-page > svg { color: var(--blue); }.about-page h2 { font-size: 30px; }.about-page p { color: #5f6872; font-size: 16px; line-height: 1.7; }
+.version-line { margin-top: -12px; }
+.update-card { margin-top: 26px; padding: 18px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+.update-card h3 { margin: 0 0 8px; font-size: 18px; }
+.update-card p { margin: 0 0 12px; font-size: 13px; line-height: 1.55; }
+.update-result { margin-top: 12px; padding: 13px; border: 1px solid var(--soft-line); border-radius: 7px; background: #f7f8f6; }
+.update-result.has-update { border-color: #b5d9bd; background: var(--green-soft); }
+.update-result strong, .update-result small, .update-result code { display: block; }
+.update-result small { margin-top: 4px; color: #626a73; font-size: 12px; line-height: 1.4; }
+.update-result code { margin-top: 9px; padding: 8px; border-radius: 5px; background: rgba(255,255,255,.72); font-size: 11px; word-break: break-all; }
 .notice-box { margin-top: 28px; padding: 16px; display: flex; gap: 11px; align-items: flex-start; border: 1px solid #e2c79d; border-radius: 7px; color: #805012; background: #fff8ec; line-height: 1.5; }
 .toast { position: fixed; right: 28px; bottom: 28px; max-width: 420px; padding: 13px 17px; border: 1px solid #b7cce5; border-radius: 7px; background: #f5f9ff; color: #174e8c; box-shadow: 0 8px 30px rgba(20,39,60,.15); cursor: pointer; z-index: 20; }
 .spin { animation: spin .8s linear infinite; }

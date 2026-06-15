@@ -4,6 +4,10 @@ dist/
 release/*
 !release/
 !release/Accio-Switch-0.2.9.exe
+!release/Accio-Switch-0.3.0.exe
+!release/Accio-Switch-0.3.1.exe
+!release/Accio-Switch-0.3.2.exe
+!release/Accio-Switch-0.3.3.exe
 src-tauri/target/
 artifacts/*.png
 artifacts/*.json
