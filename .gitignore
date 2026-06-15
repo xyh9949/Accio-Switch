@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.npm-cache/
+release/*
+!release/
+!release/Accio-Switch-0.2.9.exe
+src-tauri/target/
+artifacts/*.png
+artifacts/*.json
+npm-debug.log*

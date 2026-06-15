@@ -1,0 +1,52 @@
+{
+  "name": "accio-switch",
+  "version": "0.2.9",
+  "description": "Local routing companion for Accio Work and OpenAI-compatible model endpoints.",
+  "author": "Accio Switch",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build --configLoader native",
+    "preview": "vite preview --host 127.0.0.1",
+    "tauri": "tauri",
+    "desktop": "tauri dev",
+    "desktop:build": "tauri build",
+    "electron": "electron electron/main.cjs",
+    "electron:dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron electron/main.cjs\"",
+    "electron:build": "npm run build && node scripts/build-electron.mjs",
+    "test": "node --test electron/protocol.test.cjs"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "@tauri-apps/api": "^2.11.0",
+    "@vitejs/plugin-react": "5.0.4",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "vite": "6.4.2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.2",
+    "concurrently": "^9.2.1",
+    "electron": "^36.9.5",
+    "electron-builder": "^26.0.12",
+    "wait-on": "^8.0.3"
+  },
+  "main": "electron/main.cjs",
+  "build": {
+    "appId": "com.accioswitch.desktop",
+    "productName": "Accio Switch",
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": "portable",
+      "artifactName": "Accio-Switch-${version}.exe"
+    }
+  }
+}
