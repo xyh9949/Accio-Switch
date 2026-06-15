@@ -322,7 +322,6 @@ async fn launch_accio(state: TauriState<'_, AppState>) -> Result<LaunchResult, S
         return Err(format!("Accio executable not found: {}", config.accio_path));
     }
     let mut command = Command::new(&config.accio_path);
-    command.arg("--accio-switch");
     if custom {
         command
             .env("GATEWAY_BASE_URL", format!("http://127.0.0.1:{}", config.bridge_port))

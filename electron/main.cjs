@@ -880,7 +880,7 @@ function registerIpc() {
       delete env.GATEWAY_BASE_URL;
       delete env.ADK_MODEL;
     }
-    spawn(config.accioPath, ["--accio-switch"], { env, detached: true, stdio: "ignore", windowsHide: true }).unref();
+    spawn(config.accioPath, [], { env, detached: true, stdio: "ignore", windowsHide: false }).unref();
     const message = `Accio Work launched in ${config.mode} mode`;
     log("INFO", message);
     return { launched: true, message };
