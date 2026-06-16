@@ -1,6 +1,6 @@
 {
   "name": "accio-switch",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Local routing companion for Accio Work and OpenAI-compatible model endpoints.",
   "author": "Accio Switch",
   "private": true,

@@ -145,6 +145,35 @@ async function isAccioRunning() {
   }
 }
 
+async function stopAccioProcess() {
+  const imageName = path.basename(config.accioPath || "Accio.exe");
+  if (!(await isAccioRunning())) return false;
+  try {
+    await execFileAsync("taskkill.exe", ["/IM", imageName, "/F", "/T"], { windowsHide: true });
+  } catch (error) {
+    throw new Error(`Unable to stop Accio Work: ${error.message}`);
+  }
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    if (!(await isAccioRunning())) return true;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("Accio Work did not exit in time");
+}
+
+async function launchAccioProcess() {
+  if (!fs.existsSync(config.accioPath)) throw new Error(`Accio executable not found: ${config.accioPath}`);
+  if (config.mode === "custom" && config.autoStartBridge) await startBridge();
+  const env = { ...process.env };
+  if (config.mode === "custom") {
+    env.GATEWAY_BASE_URL = `http://127.0.0.1:${config.bridgePort}`;
+    env.ADK_MODEL = config.model;
+  } else {
+    delete env.GATEWAY_BASE_URL;
+    delete env.ADK_MODEL;
+  }
+  spawn(config.accioPath, [], { env, detached: true, stdio: "ignore", windowsHide: false }).unref();
+}
+
 function jsonResponse(res, status, value) {
   const body = Buffer.from(JSON.stringify(value));
   res.writeHead(status, {
@@ -798,6 +827,10 @@ function registerIpc() {
     appVersion: packageInfo.version,
     logs,
   }));
+  ipcMain.handle("accio-switch:get_runtime_status", async () => ({
+    bridgeRunning: Boolean(bridgeServer),
+    accioRunning: await isAccioRunning(),
+  }));
   ipcMain.handle("accio-switch:save_config", (_event, { config: next }) => {
     saveConfig(next);
     return { ok: true };
@@ -874,23 +907,20 @@ function registerIpc() {
     return result;
   });
   ipcMain.handle("accio-switch:launch_accio", async () => {
-    if (!fs.existsSync(config.accioPath)) throw new Error(`Accio executable not found: ${config.accioPath}`);
     if (await isAccioRunning()) {
-      throw new Error("Accio Work is already running. Quit it completely, then launch it from Accio Switch so the route variables can take effect.");
+      return { launched: false, accioRunning: true, message: "Accio Work is already running" };
     }
-    if (config.mode === "custom" && config.autoStartBridge) await startBridge();
-    const env = { ...process.env };
-    if (config.mode === "custom") {
-      env.GATEWAY_BASE_URL = `http://127.0.0.1:${config.bridgePort}`;
-      env.ADK_MODEL = config.model;
-    } else {
-      delete env.GATEWAY_BASE_URL;
-      delete env.ADK_MODEL;
-    }
-    spawn(config.accioPath, [], { env, detached: true, stdio: "ignore", windowsHide: false }).unref();
+    await launchAccioProcess();
     const message = `Accio Work launched in ${config.mode} mode`;
     log("INFO", message);
-    return { launched: true, message };
+    return { launched: true, accioRunning: true, message };
+  });
+  ipcMain.handle("accio-switch:restart_accio", async () => {
+    await stopAccioProcess();
+    await launchAccioProcess();
+    const message = `Accio Work restarted in ${config.mode} mode`;
+    log("INFO", message);
+    return { restarted: true, accioRunning: true, message };
   });
 }
 

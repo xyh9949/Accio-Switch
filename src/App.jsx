@@ -15,6 +15,7 @@ import {
   PlugsConnected,
   Power,
   RadioButton,
+  ArrowClockwise,
   ShareNetwork,
   ShieldCheck,
   SlidersHorizontal,
@@ -103,7 +104,9 @@ async function invoke(command, args = {}) {
     if (command === "download_update") return { downloaded: true, filePath: "C:\\Temp\\Accio-Switch-0.3.0.exe", version: "0.3.0" };
     if (command === "start_bridge") return { running: true };
     if (command === "stop_bridge") return { running: false };
-    if (command === "launch_accio") return { launched: true, message: "Accio Work launched" };
+    if (command === "get_runtime_status") return { bridgeRunning: false, accioRunning: false };
+    if (command === "launch_accio") return { launched: true, accioRunning: true, message: "Accio Work launched" };
+    if (command === "restart_accio") return { restarted: true, accioRunning: true, message: "Accio Work restarted" };
     return { ok: true };
   }
   const api = await import("@tauri-apps/api/core");
@@ -128,9 +131,38 @@ function AppIcon({ type }) {
   return <PlugsConnected size={28} weight="duotone" />;
 }
 
+const redactForSignature = (value = {}) => ({
+  mode: value.mode,
+  provider: value.provider,
+  baseUrl: value.baseUrl,
+  model: value.model,
+  apiKeyConfigured: Boolean(value.apiKey || value.apiKeyConfigured),
+  imageEnabled: Boolean(value.imageEnabled),
+  imageProtocol: value.imageProtocol,
+  imageBaseUrl: value.imageBaseUrl,
+  imageModel: value.imageModel,
+  imageApiKeyConfigured: Boolean(value.imageApiKey || value.imageApiKeyConfigured),
+  imageReuseChatKey: Boolean(value.imageReuseChatKey),
+  autoStartBridge: Boolean(value.autoStartBridge),
+  bridgePort: Number(value.bridgePort),
+  officialGateway: value.officialGateway,
+  accioPath: value.accioPath,
+});
+
+const configSignature = (value = {}) => JSON.stringify(redactForSignature(value));
+
+const savedConfigShape = (value = {}) => ({
+  ...value,
+  apiKey: "",
+  imageApiKey: "",
+  apiKeyConfigured: value.apiKeyConfigured || Boolean(value.apiKey),
+  imageApiKeyConfigured: value.imageApiKeyConfigured || Boolean(value.imageApiKey),
+});
+
 export function App() {
   const [config, setConfig] = useState(DEFAULT_CONFIG);
   const [bridgeRunning, setBridgeRunning] = useState(false);
+  const [accioRunning, setAccioRunning] = useState(false);
   const [logs, setLogs] = useState(DEMO_LOGS);
   const [showKey, setShowKey] = useState(false);
   const [showImageKey, setShowImageKey] = useState(false);
@@ -143,12 +175,23 @@ export function App() {
   const [notice, setNotice] = useState("");
   const [activeNav, setActiveNav] = useState("route");
   const [appVersion, setAppVersion] = useState("0.2.9");
+  const [savedSignature, setSavedSignature] = useState(configSignature(DEFAULT_CONFIG));
+  const [verifiedSignature, setVerifiedSignature] = useState("");
+  const [imageVerifiedSignature, setImageVerifiedSignature] = useState("");
 
   useEffect(() => {
     invoke("get_snapshot")
       .then((snapshot) => {
-        setConfig({ ...DEFAULT_CONFIG, ...snapshot.config, apiKey: "" });
+        const loadedConfig = { ...DEFAULT_CONFIG, ...snapshot.config, apiKey: "", imageApiKey: "" };
+        setConfig(loadedConfig);
+        const loadedSignature = configSignature(loadedConfig);
+        setSavedSignature(loadedSignature);
+        if (loadedConfig.baseUrl && loadedConfig.model && loadedConfig.apiKeyConfigured) setVerifiedSignature(loadedSignature);
+        if (!loadedConfig.imageEnabled || (loadedConfig.imageModel && (loadedConfig.imageReuseChatKey || loadedConfig.imageApiKeyConfigured))) {
+          setImageVerifiedSignature(loadedSignature);
+        }
         setBridgeRunning(snapshot.bridgeRunning);
+        setAccioRunning(Boolean(snapshot.accioRunning));
         if (snapshot.appVersion) setAppVersion(snapshot.appVersion);
         if (snapshot.logs?.length) setLogs(snapshot.logs.slice(-8));
         if (snapshot.config?.updateCheckOnStart && snapshot.config?.updateFeedUrl) {
@@ -161,6 +204,19 @@ export function App() {
         }
       })
       .catch((error) => setNotice(String(error)));
+  }, []);
+
+  useEffect(() => {
+    const refresh = () => {
+      invoke("get_runtime_status")
+        .then((status) => {
+          setBridgeRunning(Boolean(status.bridgeRunning));
+          setAccioRunning(Boolean(status.accioRunning));
+        })
+        .catch(() => {});
+    };
+    const timer = setInterval(refresh, 3000);
+    return () => clearInterval(timer);
   }, []);
 
   const update = (patch) => {
@@ -187,6 +243,12 @@ export function App() {
     setLogs((current) => [...current.slice(-6), { time, level, message }]);
   };
 
+  const markSaved = (nextConfig = config) => {
+    const cleanConfig = savedConfigShape(nextConfig);
+    setSavedSignature(configSignature(cleanConfig));
+    return cleanConfig;
+  };
+
   const save = async () => {
     setBusy("save");
     setNotice("");
@@ -194,13 +256,7 @@ export function App() {
       await invoke("save_config", { config });
       addLog("Configuration saved");
       setNotice("Configuration saved");
-      setConfig((current) => ({
-        ...current,
-        apiKey: "",
-        imageApiKey: "",
-        apiKeyConfigured: current.apiKeyConfigured || Boolean(current.apiKey),
-        imageApiKeyConfigured: current.imageApiKeyConfigured || Boolean(current.imageApiKey),
-      }));
+      setConfig(markSaved(config));
     } catch (error) {
       setNotice(String(error));
     } finally {
@@ -213,8 +269,10 @@ export function App() {
     setNotice("");
     try {
       await invoke("save_config", { config });
+      markSaved(config);
       const result = await invoke("test_image_endpoint");
       setImageTestResult(result);
+      if (result.ok) setImageVerifiedSignature(configSignature(config));
       addLog(result.ok ? `Image endpoint reachable in ${result.latencyMs} ms` : result.message, result.ok ? "INFO" : "ERROR");
     } catch (error) {
       const result = { ok: false, message: String(error), latencyMs: 0, modelFound: false };
@@ -230,8 +288,10 @@ export function App() {
     setNotice("");
     try {
       await invoke("save_config", { config });
+      markSaved(config);
       const result = await invoke("test_endpoint");
       setTestResult(result);
+      if (result.ok) setVerifiedSignature(configSignature(config));
       addLog(result.ok ? `Chat endpoint reachable in ${result.latencyMs} ms` : result.message, result.ok ? "INFO" : "ERROR");
     } catch (error) {
       const result = { ok: false, message: String(error), latencyMs: 0, modelFound: false };
@@ -249,14 +309,13 @@ export function App() {
       await invoke("save_config", { config });
       const result = await invoke("fetch_models");
       setModelFetchResult(result);
-      setConfig((current) => ({
-        ...current,
+      const nextConfig = markSaved({
+        ...config,
         cachedModels: result.models || [],
         modelsLastFetchedAt: result.fetchedAt || "",
-        model: result.selectedModel || current.model,
-        apiKey: "",
-        apiKeyConfigured: current.apiKeyConfigured || Boolean(current.apiKey),
-      }));
+        model: result.selectedModel || config.model,
+      });
+      setConfig(nextConfig);
       addLog(`Fetched ${(result.models || []).length} upstream model(s)`);
       setNotice(`Fetched ${(result.models || []).length} upstream model(s)`);
     } catch (error) {
@@ -276,16 +335,13 @@ export function App() {
       await invoke("save_config", { config });
       const result = await invoke("fetch_image_models");
       setImageModelFetchResult(result);
-      setConfig((current) => ({
-        ...current,
+      const nextConfig = markSaved({
+        ...config,
         cachedImageModels: result.models || [],
         imageModelsLastFetchedAt: result.fetchedAt || "",
-        imageModel: result.selectedModel || current.imageModel,
-        apiKey: "",
-        imageApiKey: "",
-        apiKeyConfigured: current.apiKeyConfigured || Boolean(current.apiKey),
-        imageApiKeyConfigured: current.imageApiKeyConfigured || Boolean(current.imageApiKey),
-      }));
+        imageModel: result.selectedModel || config.imageModel,
+      });
+      setConfig(nextConfig);
       addLog(`Fetched ${(result.models || []).length} upstream image model(s)`);
       setNotice(`Fetched ${(result.models || []).length} upstream image model(s)`);
     } catch (error) {
@@ -303,6 +359,7 @@ export function App() {
     setNotice("");
     try {
       await invoke("save_config", { config });
+      markSaved(config);
       const result = await invoke("check_update", { feedUrl: config.updateFeedUrl });
       setUpdateResult(result);
       addLog(result.hasUpdate ? `Update available: ${result.version}` : "No update available");
@@ -320,6 +377,7 @@ export function App() {
     setNotice("");
     try {
       await invoke("save_config", { config });
+      markSaved(config);
       const result = await invoke("download_update", { feedUrl: config.updateFeedUrl });
       setUpdateResult(result);
       addLog(result.downloaded ? `Downloaded update ${result.version}` : "No update to download");
@@ -349,6 +407,7 @@ export function App() {
     setNotice("");
     try {
       await invoke("save_config", { config });
+      markSaved(config);
       const result = await invoke(bridgeRunning ? "stop_bridge" : "start_bridge");
       setBridgeRunning(result.running);
       addLog(result.running ? `Bridge listening on 127.0.0.1:${config.bridgePort}` : "Bridge stopped");
@@ -365,8 +424,10 @@ export function App() {
     setNotice("");
     try {
       await invoke("save_config", { config });
-      const result = await invoke("launch_accio");
+      markSaved(config);
+      const result = await invoke(accioRunning ? "restart_accio" : "launch_accio");
       if (config.mode === "custom") setBridgeRunning(true);
+      setAccioRunning(Boolean(result.accioRunning ?? true));
       addLog(result.message || `Accio launched in ${config.mode} mode`);
       setNotice(result.message || "Accio Work launched");
     } catch (error) {
@@ -377,17 +438,45 @@ export function App() {
     }
   };
 
+  const currentSignature = configSignature(savedConfigShape(config));
+  const isConfigSaved = currentSignature === savedSignature;
+  const endpointConfigured = Boolean(config.baseUrl && config.model && (config.apiKey || config.apiKeyConfigured));
+  const endpointVerified = endpointConfigured && verifiedSignature === currentSignature;
+  const imageRouteConfigured = !config.imageEnabled || (Boolean(config.imageModel) && !looksLikeApiKey(config.imageModel) && (config.imageReuseChatKey || config.imageApiKey || config.imageApiKeyConfigured));
+  const imageRouteVerified = imageRouteConfigured && imageVerifiedSignature === currentSignature;
+  const readyForLaunch = config.mode === "official"
+    ? isConfigSaved
+    : Boolean(bridgeRunning && endpointConfigured && isConfigSaved && imageRouteConfigured);
+
   const readiness = [
     { label: "Bridge service", value: bridgeRunning ? `127.0.0.1:${config.bridgePort}` : "Stopped", ok: bridgeRunning },
-    { label: "Custom endpoint", value: testResult?.ok ? `${testResult.latencyMs} ms` : "Not tested", ok: Boolean(testResult?.ok) },
+    {
+      label: "Configuration",
+      value: isConfigSaved ? "Saved" : "Modified",
+      ok: isConfigSaved,
+    },
+    {
+      label: "Custom endpoint",
+      value: endpointVerified
+        ? `Verified${testResult?.ok ? ` (${testResult.latencyMs} ms)` : ""}`
+        : endpointConfigured
+          ? "Configured"
+          : "Missing config",
+      ok: endpointConfigured && isConfigSaved,
+    },
     { label: "Authentication", value: config.apiKey || config.apiKeyConfigured ? "Key configured" : "Missing key", ok: Boolean(config.apiKey || config.apiKeyConfigured) },
     { label: "Chat model", value: config.model || "Not set", ok: Boolean(config.model) },
     { label: "Model list", value: config.cachedModels?.length ? `${config.cachedModels.length} cached` : "Manual", ok: true },
     {
       label: "Image route",
-      value: config.imageEnabled ? (config.imageModel || "Not set") : "Disabled",
-      ok: !config.imageEnabled || (Boolean(config.imageModel) && !looksLikeApiKey(config.imageModel)),
+      value: config.imageEnabled
+        ? imageRouteVerified
+          ? `Verified${imageTestResult?.ok ? ` (${imageTestResult.latencyMs} ms)` : ""}`
+          : (config.imageModel || "Not set")
+        : "Disabled",
+      ok: imageRouteConfigured && isConfigSaved,
     },
+    { label: "Accio Work", value: accioRunning ? "Running" : "Closed", ok: true },
   ];
 
   return (
@@ -428,8 +517,8 @@ export function App() {
               Save
             </button>
             <button className="launch-button" onClick={launchAccio} disabled={busy}>
-              {busy === "launch" ? <CircleNotch className="spin" size={18} /> : <Play size={18} weight="fill" />}
-              Launch Accio
+              {busy === "launch" ? <CircleNotch className="spin" size={18} /> : accioRunning ? <ArrowClockwise size={18} weight="bold" /> : <Play size={18} weight="fill" />}
+              {accioRunning ? "Restart Accio" : "Launch Accio"}
             </button>
           </div>
         </header>
@@ -680,12 +769,12 @@ export function App() {
                 </div>
               </section>
 
-              <section className={`readiness ${bridgeRunning && testResult?.ok ? "healthy" : ""}`}>
+              <section className={`readiness ${readyForLaunch ? "healthy" : ""}`}>
                 <div className="readiness-head">
-                  {bridgeRunning && testResult?.ok ? <CheckCircle size={34} weight="fill" /> : <Warning size={34} weight="fill" />}
+                  {readyForLaunch ? <CheckCircle size={34} weight="fill" /> : <Warning size={34} weight="fill" />}
                   <span>
-                    <strong>{bridgeRunning && testResult?.ok ? "Ready to launch" : "Setup in progress"}</strong>
-                    <small>{bridgeRunning && testResult?.ok ? "The custom route is active and healthy." : "Complete the checks below before launch."}</small>
+                    <strong>{readyForLaunch ? (accioRunning ? "Accio is running" : "Ready to launch") : "Setup in progress"}</strong>
+                    <small>{readyForLaunch ? "Saved configuration is ready. Run tests when you want to re-verify upstream reachability." : "Save required changes before launch."}</small>
                   </span>
                 </div>
                 <div className="check-list">
