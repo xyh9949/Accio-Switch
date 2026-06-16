@@ -15,7 +15,7 @@ Build the portable Windows executable:
 npm run electron:build
 ```
 
-The packaged executable is written to `release/Accio-Switch-0.3.4.exe`.
+The packaged executable is written to `release/Accio-Switch-0.3.5.exe`.
 
 ## Current compatibility
 

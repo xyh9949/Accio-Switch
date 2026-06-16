@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowSquareOut,
-  CaretDown,
   CheckCircle,
   CircleNotch,
   CloudArrowUp,
@@ -508,7 +507,6 @@ export function App() {
                           ) : (
                             <input value={config.model} onChange={(event) => update({ model: event.target.value })} disabled={config.mode === "official"} />
                           )}
-                          <CaretDown size={16} />
                         </div>
                         <small>{config.modelsLastFetchedAt ? `Fetched ${config.cachedModels?.length || 0} model(s) from upstream.` : "Fetch models from NewAPI/OpenAI-compatible /models, or type manually."}</small>
                       </label>
