@@ -51,7 +51,14 @@ let apiKey = "";
 let imageApiKey = "";
 let bridgeServer = null;
 let logs = [];
+let mainWindow = null;
 const execFileAsync = promisify(execFile);
+
+const allowMultipleInstances = Boolean(process.env.ACCIO_SWITCH_CAPTURE || process.env.ACCIO_SWITCH_SMOKE);
+const singleInstanceLock = allowMultipleInstances || app.requestSingleInstanceLock();
+if (!singleInstanceLock) {
+  app.quit();
+}
 
 function now() {
   return new Date().toLocaleTimeString("en-GB", { hour12: false });
@@ -888,7 +895,7 @@ function registerIpc() {
 }
 
 function createWindow() {
-  const window = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     show: !process.env.ACCIO_SWITCH_CAPTURE,
     width: 1440,
     height: 1024,
@@ -902,6 +909,10 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
     },
+  });
+  const window = mainWindow;
+  window.on("closed", () => {
+    if (mainWindow === window) mainWindow = null;
   });
   const devUrl = process.env.VITE_DEV_SERVER_URL || "http://127.0.0.1:5173";
   const useDist = app.isPackaged || Boolean(process.env.ACCIO_SWITCH_CAPTURE) || Boolean(process.env.ACCIO_SWITCH_SMOKE);
@@ -953,7 +964,22 @@ function createWindow() {
   }
 }
 
+function showMainWindow() {
+  const window = mainWindow || BrowserWindow.getAllWindows()[0];
+  if (!window) return;
+  if (window.isMinimized()) window.restore();
+  if (!window.isVisible()) window.show();
+  window.focus();
+}
+
+if (!allowMultipleInstances) {
+  app.on("second-instance", () => {
+    showMainWindow();
+  });
+}
+
 app.whenReady().then(() => {
+  if (!singleInstanceLock) return;
   loadConfig();
   registerIpc();
   createWindow();

@@ -10,6 +10,7 @@ release/*
 !release/Accio-Switch-0.3.3.exe
 !release/Accio-Switch-0.3.4.exe
 !release/Accio-Switch-0.3.5.exe
+!release/Accio-Switch-0.3.6.exe
 src-tauri/target/
 artifacts/*.png
 artifacts/*.json
