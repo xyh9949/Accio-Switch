@@ -20,6 +20,50 @@ const {
   sseResponse,
 } = require("./protocol.cjs");
 
+const PROVIDER_REQUEST_LIMITS = [
+  {
+    label: "standard",
+    maxRequestChars: 180000,
+    options: {},
+  },
+  {
+    label: "compact",
+    maxRequestChars: 120000,
+    options: {
+      maxToolContentChars: 12 * 1024,
+      maxTextContentChars: 48 * 1024,
+      maxOutputTokens: 8192,
+      maxToolDescriptionChars: 800,
+      maxSchemaDescriptionChars: 300,
+      maxSchemaExampleChars: 400,
+    },
+  },
+  {
+    label: "aggressive",
+    maxRequestChars: 70000,
+    options: {
+      maxToolContentChars: 5 * 1024,
+      maxTextContentChars: 20 * 1024,
+      maxOutputTokens: 4096,
+      maxToolDescriptionChars: 420,
+      maxSchemaDescriptionChars: 180,
+      maxSchemaExampleChars: 180,
+    },
+  },
+  {
+    label: "emergency",
+    maxRequestChars: 42000,
+    options: {
+      maxToolContentChars: 2 * 1024,
+      maxTextContentChars: 10 * 1024,
+      maxOutputTokens: 2048,
+      maxToolDescriptionChars: 240,
+      maxSchemaDescriptionChars: 120,
+      maxSchemaExampleChars: 120,
+    },
+  },
+];
+
 const DEFAULT_CONFIG = {
   mode: "custom",
   provider: "OpenAI Compatible",
@@ -352,7 +396,8 @@ async function requestProvider(providerRequest) {
       const detail = providerError || title || (cloudflareCode ? `Cloudflare error ${cloudflareCode}` : responseText.slice(0, 240));
       const transient = (response.status >= 500 && response.status <= 599)
         || (response.status === 429 && upstreamError && upstreamStatus);
-      if (transient && attempt === 1) {
+      const shouldRetrySameRequest = transient && attempt === 1 && response.status !== 504 && requestBody.length <= 120000;
+      if (shouldRetrySameRequest) {
         log("WARN", `Provider HTTP ${response.status}${upstreamStatus ? ` upstream ${upstreamStatus}` : ""}; retrying custom endpoint once (${requestBody.length} request chars)`);
         await new Promise((resolve) => setTimeout(resolve, 1200));
         continue;
@@ -453,21 +498,57 @@ function summarizeAccioToolInputs(input = {}) {
   return `Accio input tool payloads: count=${records.length}, totalValueChars=${totalChars}, longest=${longest.kind}:${longest.name}:${longest.length}, shapes=${shapes}`;
 }
 
+function providerRequestForLevel(input, level) {
+  const request = accioToOpenAI(input, config.model, level.options);
+  return {
+    level,
+    request,
+    chars: JSON.stringify(request).length,
+  };
+}
+
+function buildSizedProviderRequest(input, startIndex = 0) {
+  let previous = null;
+  for (let index = startIndex; index < PROVIDER_REQUEST_LIMITS.length; index += 1) {
+    const level = PROVIDER_REQUEST_LIMITS[index];
+    const candidate = providerRequestForLevel(input, level);
+    if (previous) {
+      log("WARN", `LLM request compacted from ${previous.chars} to ${candidate.chars} chars (${candidate.level.label})`);
+    }
+    if (candidate.chars <= level.maxRequestChars || index === PROVIDER_REQUEST_LIMITS.length - 1) {
+      return { ...candidate, index };
+    }
+    previous = candidate;
+  }
+  return { ...providerRequestForLevel(input, PROVIDER_REQUEST_LIMITS.at(-1)), index: PROVIDER_REQUEST_LIMITS.length - 1 };
+}
+
+function isLikelyProviderTimeout(error) {
+  const message = String(error?.message || error);
+  return /Provider HTTP (?:504|524|522|502|503)|Gateway Time-out|timeout|timed out/i.test(message);
+}
+
 async function callCustomLLM(input) {
   if (!apiKey) throw new Error("API key is not configured");
   const started = Date.now();
   const accioToolSummary = summarizeAccioToolInputs(input);
   if (accioToolSummary) log("INFO", accioToolSummary);
-  let providerRequest = accioToOpenAI(input, config.model);
-  let requestChars = JSON.stringify(providerRequest).length;
-  if (requestChars > 180000) {
-    providerRequest = accioToOpenAI(input, config.model, { maxToolContentChars: 12 * 1024 });
-    const compactedChars = JSON.stringify(providerRequest).length;
-    log("WARN", `Large LLM request compacted from ${requestChars} to ${compactedChars} chars before upstream call`);
-    requestChars = compactedChars;
-  }
+  let sizedRequest = buildSizedProviderRequest(input);
+  let providerRequest = sizedRequest.request;
+  let requestChars = sizedRequest.chars;
   log("INFO", `LLM request: model=${config.model}, messages=${providerRequest.messages.length}, tools=${providerRequest.tools?.length || 0}, requestChars=${requestChars}${summarizeToolResults(providerRequest.messages)}`);
-  let payload = await requestProvider(providerRequest);
+  let payload;
+  try {
+    payload = await requestProvider(providerRequest);
+  } catch (error) {
+    if (!isLikelyProviderTimeout(error) || sizedRequest.index >= PROVIDER_REQUEST_LIMITS.length - 1) throw error;
+    const fallbackRequest = buildSizedProviderRequest(input, sizedRequest.index + 1);
+    providerRequest = fallbackRequest.request;
+    requestChars = fallbackRequest.chars;
+    sizedRequest = fallbackRequest;
+    log("WARN", `Provider timed out; retrying with ${sizedRequest.level.label} request (${requestChars} chars, max_tokens=${providerRequest.max_tokens})`);
+    payload = await requestProvider(providerRequest);
+  }
   let converted = openAIToAccio(payload, config.model);
   const invalidCalls = findInvalidToolCalls(converted, providerRequest.tools);
   if (invalidCalls.length) {

@@ -31,6 +31,7 @@ function parseJsonOrText(value, fallback = "") {
 }
 
 const MAX_TOOL_CONTENT_CHARS = 32 * 1024;
+const MAX_TEXT_CONTENT_CHARS = 96 * 1024;
 const MAX_TOOL_DESCRIPTION_CHARS = 1200;
 const MAX_SCHEMA_DESCRIPTION_CHARS = 500;
 const MAX_SCHEMA_EXAMPLE_CHARS = 800;
@@ -69,9 +70,22 @@ function compactText(value, maxChars) {
   return `${value.slice(0, headLength)}${marker}${value.slice(-tailLength)}`;
 }
 
-function compactSchema(value, key = "") {
+function compactMessageContent(value, maxChars = MAX_TEXT_CONTENT_CHARS) {
+  if (typeof value === "string") return compactText(value, maxChars);
+  if (!Array.isArray(value)) return value;
+  return value.map((part) => {
+    if (typeof part === "string") return compactText(part, maxChars);
+    if (part?.text && typeof part.text === "string") return { ...part, text: compactText(part.text, maxChars) };
+    if (part?.content && typeof part.content === "string") return { ...part, content: compactText(part.content, maxChars) };
+    return part;
+  });
+}
+
+function compactSchema(value, key = "", options = {}) {
+  const maxSchemaDescriptionChars = options.maxSchemaDescriptionChars || MAX_SCHEMA_DESCRIPTION_CHARS;
+  const maxSchemaExampleChars = options.maxSchemaExampleChars || MAX_SCHEMA_EXAMPLE_CHARS;
   if (typeof value === "string") {
-    const limit = key === "description" || key === "$comment" ? MAX_SCHEMA_DESCRIPTION_CHARS : MAX_SCHEMA_EXAMPLE_CHARS;
+    const limit = key === "description" || key === "$comment" ? maxSchemaDescriptionChars : maxSchemaExampleChars;
     return key === "description" || key === "$comment" || key === "examples"
       ? compactText(value, limit)
       : value;
@@ -79,14 +93,14 @@ function compactSchema(value, key = "") {
   if (Array.isArray(value)) {
     if (key === "examples") {
       return value.slice(0, 3).map((item) => (
-        typeof item === "string" ? compactText(item, MAX_SCHEMA_EXAMPLE_CHARS) : compactSchema(item)
+        typeof item === "string" ? compactText(item, maxSchemaExampleChars) : compactSchema(item, "", options)
       ));
     }
-    return value.map((item) => compactSchema(item));
+    return value.map((item) => compactSchema(item, "", options));
   }
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(
-    Object.entries(value).map(([entryKey, entryValue]) => [entryKey, compactSchema(entryValue, entryKey)]),
+    Object.entries(value).map(([entryKey, entryValue]) => [entryKey, compactSchema(entryValue, entryKey, options)]),
   );
 }
 
@@ -141,7 +155,7 @@ function normalizeMessageContent(value, fallback = "") {
   return JSON.stringify(value);
 }
 
-function normalizeFlatMessage(item = {}, maxToolContentChars = MAX_TOOL_CONTENT_CHARS) {
+function normalizeFlatMessage(item = {}, maxToolContentChars = MAX_TOOL_CONTENT_CHARS, maxTextContentChars = MAX_TEXT_CONTENT_CHARS) {
   const role = item.role === "model" ? "assistant" : item.role || "user";
   const calls = item.toolCalls || item.tool_calls;
   const flatToolCallId = firstPresent(item, ["toolCallId", "tool_call_id", "callId", "call_id"]);
@@ -169,11 +183,12 @@ function normalizeFlatMessage(item = {}, maxToolContentChars = MAX_TOOL_CONTENT_
 
   return {
     role,
-    content: normalizeMessageContent(item.content),
+    content: compactMessageContent(normalizeMessageContent(item.content), maxTextContentChars),
   };
 }
 
-function normalizeTools(tools = []) {
+function normalizeTools(tools = [], options = {}) {
+  const maxToolDescriptionChars = options.maxToolDescriptionChars || MAX_TOOL_DESCRIPTION_CHARS;
   const declarations = tools.flatMap((group) => {
     if (group?.name) return [group];
     return group?.functionDeclarations || group?.function_declarations || [];
@@ -183,11 +198,11 @@ function normalizeTools(tools = []) {
     type: "function",
     function: {
       name: fn.name,
-      description: compactText(fn.description || "", MAX_TOOL_DESCRIPTION_CHARS),
+      description: compactText(fn.description || "", maxToolDescriptionChars),
       parameters: compactSchema(fn.parameters || parseJson(fn.parametersJson || fn.parameters_json, {
         type: "object",
         properties: {},
-      })),
+      }), "", options),
     },
   }));
 }
@@ -268,14 +283,15 @@ function imageFrame({ data, mimeType = "image/png", text = "", model = "" }) {
 
 function accioToOpenAI(input, model, options = {}) {
   const maxToolContentChars = options.maxToolContentChars || MAX_TOOL_CONTENT_CHARS;
+  const maxTextContentChars = options.maxTextContentChars || MAX_TEXT_CONTENT_CHARS;
   const messages = [];
   const system = input.systemInstruction || input.system_instruction;
   const systemText = typeof system === "string" ? system : textFromParts(system?.parts);
-  if (systemText) messages.push({ role: "system", content: systemText });
+  if (systemText) messages.push({ role: "system", content: compactText(systemText, maxTextContentChars) });
 
   for (const item of input.contents || input.messages || []) {
     if (!Array.isArray(item.parts)) {
-      messages.push(normalizeFlatMessage(item, maxToolContentChars));
+      messages.push(normalizeFlatMessage(item, maxToolContentChars, maxTextContentChars));
       continue;
     }
 
@@ -285,7 +301,7 @@ function accioToOpenAI(input, model, options = {}) {
     const toolResponses = [];
 
     for (const part of item.parts) {
-      if (typeof part.text === "string") content.push({ type: "text", text: part.text });
+      if (typeof part.text === "string") content.push({ type: "text", text: compactText(part.text, maxTextContentChars) });
 
       const image = part.inlineData || part.inline_data;
       if (image?.data) {
@@ -322,14 +338,14 @@ function accioToOpenAI(input, model, options = {}) {
     if (toolCalls.length) {
       messages.push({
         role: "assistant",
-        content: content.length ? content.map((part) => part.text || "").join("\n") : null,
+        content: content.length ? compactText(content.map((part) => part.text || "").join("\n"), maxTextContentChars) : null,
         tool_calls: toolCalls,
       });
     } else if (content.length) {
       const onlyText = content.every((part) => part.type === "text");
       messages.push({
         role,
-        content: onlyText ? content.map((part) => part.text).join("\n") : content,
+        content: onlyText ? compactText(content.map((part) => part.text).join("\n"), maxTextContentChars) : content,
       });
     }
 
@@ -337,14 +353,18 @@ function accioToOpenAI(input, model, options = {}) {
   }
 
   const generation = generationConfigFromInput(input);
-  const tools = normalizeTools(input.tools);
+  const tools = normalizeTools(input.tools, options);
+  const requestedMaxTokens = input.maxOutputTokens || input.max_output_tokens
+    || generation.maxOutputTokens || generation.max_output_tokens || 16384;
+  const maxTokens = options.maxOutputTokens
+    ? Math.min(requestedMaxTokens, options.maxOutputTokens)
+    : requestedMaxTokens;
   return {
     model,
     messages,
     stream: false,
     temperature: input.temperature ?? generation.temperature ?? 0.7,
-    max_tokens: input.maxOutputTokens || input.max_output_tokens
-      || generation.maxOutputTokens || generation.max_output_tokens || 16384,
+    max_tokens: maxTokens,
     ...(input.topP ?? generation.topP ? { top_p: input.topP ?? generation.topP } : {}),
     ...(Array.isArray(input.stopSequences) && input.stopSequences.length
       ? { stop: input.stopSequences }
@@ -578,6 +598,7 @@ function sseResponse(res, status, frames) {
 module.exports = {
   accioToOpenAI,
   buildToolRepairRequest,
+  compactMessageContent,
   compactToolContent,
   toolResultContent,
   extractImageRequest,

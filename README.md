@@ -15,7 +15,7 @@ Build the portable Windows executable:
 npm run electron:build
 ```
 
-The packaged executable is written to `release/Accio-Switch-0.3.7.exe`.
+The packaged executable is written to `release/Accio-Switch-0.3.8.exe`.
 
 ## Current compatibility
 
@@ -35,6 +35,7 @@ The packaged executable is written to `release/Accio-Switch-0.3.7.exe`.
 - Chat Completions image output and OpenAI Images API generation/editing
 - No official LLM or image-model fallback in custom mode
 - Large tool results compacted before upstream model calls
+- Oversized LLM requests compacted progressively to reduce provider 504 timeouts
 - One retry for transient third-party provider 5xx responses
 - Transparent forwarding for non-LLM Accio API routes
 - Optional fallback to the official Accio gateway

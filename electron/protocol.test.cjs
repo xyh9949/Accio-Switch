@@ -348,6 +348,25 @@ test("can further compact tool results for oversized upstream requests", () => {
   assert.match(request.messages[0].content, /Accio Switch compacted/);
 });
 
+test("compacts oversized plain text messages", () => {
+  const request = accioToOpenAI({
+    contents: [{ role: "user", parts: [{ text: `BEGIN-${"x".repeat(50000)}-END` }] }],
+  }, "custom-model", { maxTextContentChars: 4000 });
+  assert.equal(request.messages[0].role, "user");
+  assert.ok(request.messages[0].content.length <= 4000);
+  assert.match(request.messages[0].content, /^BEGIN-/);
+  assert.match(request.messages[0].content, /-END$/);
+  assert.match(request.messages[0].content, /Accio Switch compacted/);
+});
+
+test("can cap max output tokens for compact retries", () => {
+  const request = accioToOpenAI({
+    contents: [{ role: "user", parts: [{ text: "Summarize this" }] }],
+    generationConfig: { maxOutputTokens: 16000 },
+  }, "custom-model", { maxOutputTokens: 2048 });
+  assert.equal(request.max_tokens, 2048);
+});
+
 test("compacts long tool descriptions and schema comments", () => {
   const longDescription = `BEGIN-${"x".repeat(5000)}-END`;
   const request = accioToOpenAI({
@@ -370,6 +389,31 @@ test("compacts long tool descriptions and schema comments", () => {
   assert.match(tool.description, /-END$/);
   assert.ok(tool.parameters.description.length <= 500);
   assert.ok(tool.parameters.properties.query.description.length <= 500);
+});
+
+test("can aggressively compact tool descriptions and schema comments", () => {
+  const longDescription = `BEGIN-${"x".repeat(5000)}-END`;
+  const request = accioToOpenAI({
+    contents: [{ role: "user", parts: [{ text: "Use the tool" }] }],
+    tools: [{
+      name: "large_tool",
+      description: longDescription,
+      parameters: {
+        type: "object",
+        description: longDescription,
+        properties: {
+          query: { type: "string", description: longDescription },
+        },
+      },
+    }],
+  }, "custom-model", {
+    maxToolDescriptionChars: 240,
+    maxSchemaDescriptionChars: 120,
+  });
+  const tool = request.tools[0].function;
+  assert.ok(tool.description.length <= 240);
+  assert.ok(tool.parameters.description.length <= 120);
+  assert.ok(tool.parameters.properties.query.description.length <= 120);
 });
 
 test("preserves Accio orchestration tools without business-specific routing", () => {
