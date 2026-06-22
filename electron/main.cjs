@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, safeStorage, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, Menu, safeStorage, shell, Tray } = require("electron");
 const { execFile, spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const { promisify } = require("node:util");
@@ -96,6 +96,8 @@ let imageApiKey = "";
 let bridgeServer = null;
 let logs = [];
 let mainWindow = null;
+let tray = null;
+let trayHintShown = false;
 const execFileAsync = promisify(execFile);
 
 const allowMultipleInstances = Boolean(process.env.ACCIO_SWITCH_CAPTURE || process.env.ACCIO_SWITCH_SMOKE);
@@ -216,6 +218,15 @@ async function launchAccioProcess() {
     delete env.ADK_MODEL;
   }
   spawn(config.accioPath, [], { env, detached: true, stdio: "ignore", windowsHide: false }).unref();
+}
+
+async function launchOrRestartAccio() {
+  const restarting = await isAccioRunning();
+  if (restarting) await stopAccioProcess();
+  await launchAccioProcess();
+  const message = `Accio Work ${restarting ? "restarted" : "launched"} in ${config.mode} mode`;
+  log("INFO", message);
+  return message;
 }
 
 function jsonResponse(res, status, value) {
@@ -1022,6 +1033,19 @@ function createWindow() {
     },
   });
   const window = mainWindow;
+  window.on("minimize", (event) => {
+    if (allowMultipleInstances) return;
+    event.preventDefault();
+    window.hide();
+    if (tray && process.platform === "win32" && !trayHintShown) {
+      trayHintShown = true;
+      tray.displayBalloon({
+        title: "Accio Switch",
+        content: "Accio Switch is still running in the system tray.",
+        iconType: "info",
+      });
+    }
+  });
   window.on("closed", () => {
     if (mainWindow === window) mainWindow = null;
   });
@@ -1075,16 +1099,51 @@ function createWindow() {
   }
 }
 
+function createTray() {
+  if (tray || allowMultipleInstances) return;
+  tray = new Tray(path.join(__dirname, "tray-icon.png"));
+  tray.setToolTip("Accio Switch");
+  const buildMenu = async () => {
+    const accioRunning = await isAccioRunning();
+    return Menu.buildFromTemplate([
+      {
+        label: "Show Accio Switch",
+        click: showMainWindow,
+      },
+      {
+        label: accioRunning ? "Restart Accio" : "Launch Accio",
+        click: () => {
+          launchOrRestartAccio().catch((error) => log("ERROR", error.message));
+        },
+      },
+      { type: "separator" },
+      {
+        label: "Exit",
+        click: () => app.quit(),
+      },
+    ]);
+  };
+  tray.on("click", showMainWindow);
+  tray.on("right-click", () => {
+    buildMenu()
+      .then((menu) => tray?.popUpContextMenu(menu))
+      .catch((error) => log("ERROR", error.message));
+  });
+}
+
 function showMainWindow() {
   const window = mainWindow || BrowserWindow.getAllWindows()[0];
-  if (!window) return;
+  if (!window || window.isDestroyed()) return;
+  window.setSkipTaskbar(false);
   if (window.isMinimized()) window.restore();
-  if (!window.isVisible()) window.show();
+  window.show();
+  window.moveTop();
   window.focus();
 }
 
 if (!allowMultipleInstances) {
   app.on("second-instance", () => {
+    log("INFO", "Second Accio Switch launch focused the existing window");
     showMainWindow();
   });
 }
@@ -1094,9 +1153,15 @@ app.whenReady().then(() => {
   loadConfig();
   registerIpc();
   createWindow();
+  createTray();
 });
 
 app.on("window-all-closed", async () => {
   await stopBridge();
   if (process.platform !== "darwin") app.quit();
+});
+
+app.on("before-quit", () => {
+  tray?.destroy();
+  tray = null;
 });
