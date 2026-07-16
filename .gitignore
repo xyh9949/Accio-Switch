@@ -1,20 +1,11 @@
 node_modules/
 dist/
 .npm-cache/
-release/*
-!release/
-!release/Accio-Switch-0.2.9.exe
-!release/Accio-Switch-0.3.0.exe
-!release/Accio-Switch-0.3.1.exe
-!release/Accio-Switch-0.3.2.exe
-!release/Accio-Switch-0.3.3.exe
-!release/Accio-Switch-0.3.4.exe
-!release/Accio-Switch-0.3.5.exe
-!release/Accio-Switch-0.3.6.exe
-!release/Accio-Switch-0.3.7.exe
-!release/Accio-Switch-0.3.8.exe
-!release/Accio-Switch-0.3.9.exe
+release/
 src-tauri/target/
-artifacts/*.png
-artifacts/*.json
+artifacts/
 npm-debug.log*
+nul
+
+# Local-only project notes
+新窗口交接说明.md

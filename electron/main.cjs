@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const { promisify } = require("node:util");
 const fs = require("node:fs");
 const http = require("node:http");
+const os = require("node:os");
 const path = require("node:path");
 const { Readable } = require("node:stream");
 const packageInfo = require("../package.json");
@@ -15,15 +16,22 @@ const {
   imageFrame,
   imageSizeForOpenAI,
   isImageOutputRequest,
+  openSseResponse,
   openAIToAccio,
   parseProviderBody,
   sseResponse,
 } = require("./protocol.cjs");
+const {
+  findAlibabaAuthorizationStatus,
+  findGatewayStatus,
+  forcedModelRoutingResponse,
+  isModelRoutingRequest,
+} = require("./routing.cjs");
 
 const PROVIDER_REQUEST_LIMITS = [
   {
     label: "standard",
-    maxRequestChars: 180000,
+    maxRequestChars: 120000,
     options: {},
   },
   {
@@ -63,12 +71,16 @@ const PROVIDER_REQUEST_LIMITS = [
     },
   },
 ];
+const ENDPOINT_TEST_TIMEOUT_MS = 20_000;
+const BRIDGE_PORT_SEARCH_LIMIT = 20;
+const SSE_HEARTBEAT_INTERVAL_MS = 15_000;
 
 const DEFAULT_CONFIG = {
   mode: "custom",
   provider: "OpenAI Compatible",
   baseUrl: "https://api.openai.com/v1",
   model: "gpt-4.1-mini",
+  embeddingModel: "text-embedding-3-small",
   cachedModels: [],
   modelsLastFetchedAt: "",
   apiKey: "",
@@ -98,6 +110,8 @@ let logs = [];
 let mainWindow = null;
 let tray = null;
 let trayHintShown = false;
+let accioRoutingVerified = false;
+let alibabaAccountConnected = false;
 const execFileAsync = promisify(execFile);
 
 const allowMultipleInstances = Boolean(process.env.ACCIO_SWITCH_CAPTURE || process.env.ACCIO_SWITCH_SMOKE);
@@ -193,31 +207,107 @@ async function isAccioRunning() {
 
 async function stopAccioProcess() {
   const imageName = path.basename(config.accioPath || "Accio.exe");
-  if (!(await isAccioRunning())) return false;
+  if (!(await isAccioRunning())) {
+    accioRoutingVerified = false;
+    return false;
+  }
   try {
     await execFileAsync("taskkill.exe", ["/IM", imageName, "/F", "/T"], { windowsHide: true });
   } catch (error) {
     throw new Error(`Unable to stop Accio Work: ${error.message}`);
   }
   for (let attempt = 0; attempt < 24; attempt += 1) {
-    if (!(await isAccioRunning())) return true;
+    if (!(await isAccioRunning())) {
+      accioRoutingVerified = false;
+      return true;
+    }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error("Accio Work did not exit in time");
 }
 
+function accioSdkLogPath() {
+  return path.join(os.homedir(), ".accio", "logs", "sdk.log");
+}
+
+function readFileTail(filePath, maxBytes = 2 * 1024 * 1024) {
+  const stats = fs.statSync(filePath);
+  const length = Math.min(stats.size, maxBytes);
+  const buffer = Buffer.alloc(length);
+  const descriptor = fs.openSync(filePath, "r");
+  try {
+    fs.readSync(descriptor, buffer, 0, length, stats.size - length);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return buffer.toString("utf8");
+}
+
+async function verifyAccioGateway(launchedAt) {
+  const expectedGateway = `http://127.0.0.1:${config.bridgePort}`;
+  const sdkLog = accioSdkLogPath();
+  let gatewayVerified = false;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    if (!(await isAccioRunning())) throw new Error("Accio Work exited before model routing could be verified");
+    try {
+      const text = readFileTail(sdkLog);
+      const status = findGatewayStatus(text, launchedAt - 1000, expectedGateway);
+      if (status && !status.verified) {
+        throw new Error(`Accio Work started with the official gateway instead of ${expectedGateway}`);
+      }
+      if (status?.verified && !gatewayVerified) {
+        gatewayVerified = true;
+        accioRoutingVerified = true;
+        log("INFO", `Accio model routing verified through ${expectedGateway}`);
+      }
+      const accountStatus = findAlibabaAuthorizationStatus(text, launchedAt - 1000);
+      if (accountStatus?.connected) {
+        alibabaAccountConnected = true;
+        log("INFO", "Alibaba.com account connection verified through Accio official authorization");
+        return;
+      }
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
+  }
+  if (!gatewayVerified) throw new Error(`Unable to verify Accio model routing through ${expectedGateway}`);
+  alibabaAccountConnected = false;
+  log("WARN", "Model routing is verified, but Alibaba.com account authorization is not connected yet");
+}
+
 async function launchAccioProcess() {
   if (!fs.existsSync(config.accioPath)) throw new Error(`Accio executable not found: ${config.accioPath}`);
   if (config.mode === "custom" && config.autoStartBridge) await startBridge();
+  accioRoutingVerified = false;
+  alibabaAccountConnected = false;
   const env = { ...process.env };
   if (config.mode === "custom") {
-    env.GATEWAY_BASE_URL = `http://127.0.0.1:${config.bridgePort}`;
+    const gatewayBaseUrl = `http://127.0.0.1:${config.bridgePort}`;
+    env.GATEWAY_BASE_URL = gatewayBaseUrl;
+    env.ADK_BASE_URL = `${gatewayBaseUrl}/api/adk/llm`;
     env.ADK_MODEL = config.model;
+    env.EMBEDDING_BASE_URL = `${gatewayBaseUrl}/api/adk/embedding/embed`;
+    env.EMBEDDING_MODEL = config.embeddingModel;
   } else {
     delete env.GATEWAY_BASE_URL;
+    delete env.ADK_BASE_URL;
     delete env.ADK_MODEL;
+    delete env.EMBEDDING_BASE_URL;
+    delete env.EMBEDDING_MODEL;
   }
+  const launchedAt = Date.now();
   spawn(config.accioPath, [], { env, detached: true, stdio: "ignore", windowsHide: false }).unref();
+  if (config.mode === "custom") {
+    try {
+      await verifyAccioGateway(launchedAt);
+    } catch (error) {
+      await stopAccioProcess().catch(() => {});
+      log("ERROR", `Accio model routing verification failed: ${error.message}`);
+      throw new Error(`${error.message}. Accio was stopped to prevent official model usage.`);
+    }
+  }
 }
 
 async function launchOrRestartAccio() {
@@ -229,6 +319,37 @@ async function launchOrRestartAccio() {
   return message;
 }
 
+async function runtimeStatus() {
+  const accioRunning = await isAccioRunning();
+  if (!accioRunning) {
+    accioRoutingVerified = false;
+    alibabaAccountConnected = false;
+  } else if (config.mode === "custom") {
+    try {
+      const sdkLog = readFileTail(accioSdkLogPath());
+      const status = findGatewayStatus(
+        sdkLog,
+        0,
+        `http://127.0.0.1:${config.bridgePort}`,
+      );
+      accioRoutingVerified = Boolean(status?.verified);
+      alibabaAccountConnected = Boolean(findAlibabaAuthorizationStatus(sdkLog)?.connected);
+    } catch {
+      accioRoutingVerified = false;
+      alibabaAccountConnected = false;
+    }
+  } else {
+    accioRoutingVerified = false;
+    alibabaAccountConnected = false;
+  }
+  return {
+    bridgeRunning: Boolean(bridgeServer),
+    accioRunning,
+    accioRoutingVerified,
+    alibabaAccountConnected,
+  };
+}
+
 function jsonResponse(res, status, value) {
   const body = Buffer.from(JSON.stringify(value));
   res.writeHead(status, {
@@ -237,6 +358,21 @@ function jsonResponse(res, status, value) {
     "access-control-allow-origin": "*",
   });
   res.end(body);
+}
+
+function keepSseResponseOpen(res) {
+  openSseResponse(res, 200);
+  res.write(": accio-switch connected\n\n");
+  const heartbeat = setInterval(() => {
+    if (!res.destroyed && !res.writableEnded) res.write(": accio-switch heartbeat\n\n");
+  }, SSE_HEARTBEAT_INTERVAL_MS);
+  heartbeat.unref?.();
+  const stop = () => {
+    clearInterval(heartbeat);
+    res.off("close", stop);
+  };
+  res.once("close", stop);
+  return stop;
 }
 
 async function readBody(req) {
@@ -387,16 +523,35 @@ async function fetchImageProviderModels() {
   };
 }
 
-async function requestProvider(providerRequest) {
+async function requestProvider(providerRequest, { timeoutMs = 0 } = {}) {
   const requestBody = JSON.stringify(providerRequest);
   const url = `${normalizedBaseUrl(config.baseUrl)}/chat/completions`;
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-      body: requestBody,
-    });
-    const responseText = await response.text();
+    const remainingMs = deadline ? deadline - Date.now() : 0;
+    if (deadline && remainingMs <= 0) {
+      throw new Error(`Provider request timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+    }
+    const controller = deadline ? new AbortController() : null;
+    const timeout = controller ? setTimeout(() => controller.abort(), remainingMs) : null;
+    let response;
+    let responseText;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+        body: requestBody,
+        signal: controller?.signal,
+      });
+      responseText = await response.text();
+    } catch (error) {
+      if (controller?.signal.aborted) {
+        throw new Error(`Provider request timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+      }
+      throw error;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
     const contentType = response.headers.get("content-type") || "";
     if (!response.ok) {
       const title = responseText.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]?.trim();
@@ -547,7 +702,11 @@ async function callCustomLLM(input) {
   let sizedRequest = buildSizedProviderRequest(input);
   let providerRequest = sizedRequest.request;
   let requestChars = sizedRequest.chars;
-  log("INFO", `LLM request: model=${config.model}, messages=${providerRequest.messages.length}, tools=${providerRequest.tools?.length || 0}, requestChars=${requestChars}${summarizeToolResults(providerRequest.messages)}`);
+  const selectedModel = providerRequest.model;
+  if (selectedModel !== config.model) {
+    log("INFO", `Accio selected ${selectedModel}; Switch default is ${config.model}`);
+  }
+  log("INFO", `LLM request: model=${selectedModel}, messages=${providerRequest.messages.length}, tools=${providerRequest.tools?.length || 0}, requestChars=${requestChars}${summarizeToolResults(providerRequest.messages)}`);
   let payload;
   try {
     payload = await requestProvider(providerRequest);
@@ -560,7 +719,7 @@ async function callCustomLLM(input) {
     log("WARN", `Provider timed out; retrying with ${sizedRequest.level.label} request (${requestChars} chars, max_tokens=${providerRequest.max_tokens})`);
     payload = await requestProvider(providerRequest);
   }
-  let converted = openAIToAccio(payload, config.model);
+  let converted = openAIToAccio(payload, selectedModel);
   const invalidCalls = findInvalidToolCalls(converted, providerRequest.tools);
   if (invalidCalls.length) {
     const invalid = invalidCalls[0];
@@ -568,7 +727,7 @@ async function callCustomLLM(input) {
     if (!repairRequest) throw new Error(`Cannot repair unknown tool call: ${invalid.name}`);
     log("WARN", `Repairing ${invalid.name} tool call; missing arguments: ${invalid.missing.join(", ")}`);
     payload = await requestProvider(repairRequest);
-    converted = openAIToAccio(payload, config.model);
+    converted = openAIToAccio(payload, selectedModel);
     const repairedCalls = converted.content.parts.filter((part) => part.functionCall?.name === invalid.name);
     const remainingInvalid = findInvalidToolCalls(converted, repairRequest.tools);
     if (!repairedCalls.length || remainingInvalid.length) {
@@ -585,7 +744,7 @@ async function callCustomLLM(input) {
     const keys = Object.keys(args);
     return `${part.functionCall.name}(${keys.join(",") || "no args"})`;
   }).join(", ");
-  log("INFO", `${config.model} completed through ${config.provider} in ${Date.now() - started} ms (${textLength} text chars, ${toolCalls.length} tool calls${toolSummary ? `: ${toolSummary}` : ""})`);
+  log("INFO", `${selectedModel} completed through ${config.provider} in ${Date.now() - started} ms (${textLength} text chars, ${toolCalls.length} tool calls${toolSummary ? `: ${toolSummary}` : ""})`);
   return converted;
 }
 
@@ -737,6 +896,7 @@ async function imageFromProviderPayload(payload, authorization) {
 
 async function callChatImage(input, credentials) {
   const request = accioToOpenAI(input, credentials.model);
+  request.model = credentials.model;
   request.modalities = ["text", "image"];
   request.generation_config = generationConfigFromInputSafe(input);
   delete request.tools;
@@ -833,6 +993,35 @@ async function callCustomImage(input) {
   return result;
 }
 
+async function callCustomEmbedding(input) {
+  if (!apiKey) throw new Error("Custom embedding route requires the configured API key");
+  const model = String(config.embeddingModel || "text-embedding-3-small").trim();
+  const response = await fetch(`${normalizedBaseUrl(config.baseUrl)}/embeddings`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      input: input?.input,
+      model,
+    }),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Embedding provider HTTP ${response.status}: ${text.slice(0, 500)}`);
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error(`Embedding provider response parse failed: ${text.slice(0, 500)}`);
+  }
+  if (!Array.isArray(payload?.data) || !payload.data.length) {
+    throw new Error("Embedding provider returned no vectors");
+  }
+  log("INFO", `Embedding request completed through custom provider using ${model}`);
+  return payload;
+}
+
 async function proxyOfficial(req, res, body) {
   const target = `${config.officialGateway.replace(/\/$/, "")}${req.url}`;
   const headers = { ...req.headers };
@@ -858,14 +1047,32 @@ async function handleBridge(req, res) {
   if (req.url === "/health") return jsonResponse(res, 200, { ok: true, model: config.model, provider: config.provider });
   if (req.url.split("?")[0] === "/api/llm/config/v2") return jsonResponse(res, 200, modelList());
   const body = await readBody(req);
+  if (config.mode === "custom" && isModelRoutingRequest(req.url, req.method, body)) {
+    log("INFO", `Forced Accio automatic model routing to ${config.model}`);
+    return jsonResponse(res, 200, forcedModelRoutingResponse(config.model));
+  }
+  if (config.mode === "custom" && req.url.split("?")[0] === "/api/adk/embedding/embed" && req.method === "POST") {
+    try {
+      return jsonResponse(res, 200, await callCustomEmbedding(JSON.parse(body.toString("utf8"))));
+    } catch (error) {
+      log("ERROR", `Custom embedding failed: ${error.message}`);
+      return jsonResponse(res, 502, { error: { message: error.message, type: "embedding_error" } });
+    }
+  }
   if (req.url.startsWith("/api/adk/llm") && req.method === "POST") {
+    const stopKeepAlive = keepSseResponseOpen(res);
     try {
       const input = JSON.parse(body.toString("utf8"));
       if (isImageOutputRequest(input)) {
-        return sseResponse(res, 200, [await callCustomImage(input)]);
+        const frame = await callCustomImage(input);
+        stopKeepAlive();
+        return sseResponse(res, 200, [frame]);
       }
-      return sseResponse(res, 200, [await callCustomLLM(input)]);
+      const frame = await callCustomLLM(input);
+      stopKeepAlive();
+      return sseResponse(res, 200, [frame]);
     } catch (error) {
+      stopKeepAlive();
       log("ERROR", `Custom LLM failed: ${error.message}`);
       return sseResponse(res, 502, [{
         errorCode: "502",
@@ -879,8 +1086,13 @@ async function handleBridge(req, res) {
 }
 
 async function startBridge() {
-  if (bridgeServer) return;
-  await new Promise((resolve, reject) => {
+  if (bridgeServer) return config.bridgePort;
+  const preferredPort = Number(config.bridgePort);
+  if (!Number.isInteger(preferredPort) || preferredPort < 1 || preferredPort > 65535) {
+    throw new Error(`Invalid bridge port: ${config.bridgePort}`);
+  }
+  for (let offset = 0; offset < BRIDGE_PORT_SEARCH_LIMIT && preferredPort + offset <= 65535; offset += 1) {
+    const port = preferredPort + offset;
     const server = http.createServer((req, res) => {
       handleBridge(req, res).catch((error) => {
         log("ERROR", error.message);
@@ -888,13 +1100,30 @@ async function startBridge() {
         else res.end();
       });
     });
-    server.once("error", reject);
-    server.listen(config.bridgePort, "127.0.0.1", () => {
-      bridgeServer = server;
-      log("INFO", `Bridge listening on http://127.0.0.1:${config.bridgePort}`);
-      resolve();
-    });
-  });
+    try {
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(port, "127.0.0.1", resolve);
+      });
+    } catch (error) {
+      if (error.code === "EADDRINUSE") {
+        log("WARN", `Bridge port ${port} is already in use; trying ${port + 1}`);
+        continue;
+      }
+      throw error;
+    }
+    bridgeServer = server;
+    if (port !== preferredPort) {
+      config.bridgePort = port;
+      saveConfig({ bridgePort: port });
+      log("WARN", `Bridge port ${preferredPort} was occupied; switched to ${port}`);
+    }
+    log("INFO", `Bridge listening on http://127.0.0.1:${port}`);
+    return port;
+  }
+  throw new Error(
+    `Bridge ports ${preferredPort}-${Math.min(preferredPort + BRIDGE_PORT_SEARCH_LIMIT - 1, 65535)} are already in use`,
+  );
 }
 
 async function stopBridge() {
@@ -906,30 +1135,29 @@ async function stopBridge() {
 }
 
 function registerIpc() {
-  ipcMain.handle("accio-switch:get_snapshot", async () => ({
-    config: {
-      ...config,
-      apiKey: "",
-      imageApiKey: "",
-      apiKeyConfigured: Boolean(apiKey),
-      imageApiKeyConfigured: Boolean(imageApiKey),
-    },
-    bridgeRunning: Boolean(bridgeServer),
-    accioRunning: await isAccioRunning(),
-    appVersion: packageInfo.version,
-    logs,
-  }));
-  ipcMain.handle("accio-switch:get_runtime_status", async () => ({
-    bridgeRunning: Boolean(bridgeServer),
-    accioRunning: await isAccioRunning(),
-  }));
+  ipcMain.handle("accio-switch:get_snapshot", async () => {
+    const status = await runtimeStatus();
+    return {
+      config: {
+        ...config,
+        apiKey: "",
+        imageApiKey: "",
+        apiKeyConfigured: Boolean(apiKey),
+        imageApiKeyConfigured: Boolean(imageApiKey),
+      },
+      ...status,
+      appVersion: packageInfo.version,
+      logs,
+    };
+  });
+  ipcMain.handle("accio-switch:get_runtime_status", runtimeStatus);
   ipcMain.handle("accio-switch:save_config", (_event, { config: next }) => {
     saveConfig(next);
     return { ok: true };
   });
   ipcMain.handle("accio-switch:start_bridge", async () => {
-    await startBridge();
-    return { running: true };
+    const bridgePort = await startBridge();
+    return { running: true, bridgePort };
   });
   ipcMain.handle("accio-switch:stop_bridge", async () => {
     await stopBridge();
@@ -945,7 +1173,7 @@ function registerIpc() {
         stream: false,
         temperature: 0,
         max_tokens: 8,
-      });
+      }, { timeoutMs: ENDPOINT_TEST_TIMEOUT_MS });
       const result = {
         ok: true,
         latencyMs: Date.now() - started,
@@ -999,20 +1227,12 @@ function registerIpc() {
     return result;
   });
   ipcMain.handle("accio-switch:launch_accio", async () => {
-    if (await isAccioRunning()) {
-      return { launched: false, accioRunning: true, message: "Accio Work is already running" };
-    }
-    await launchAccioProcess();
-    const message = `Accio Work launched in ${config.mode} mode`;
-    log("INFO", message);
-    return { launched: true, accioRunning: true, message };
+    const message = await launchOrRestartAccio();
+    return { launched: true, accioRunning: true, accioRoutingVerified, alibabaAccountConnected, bridgePort: config.bridgePort, message };
   });
   ipcMain.handle("accio-switch:restart_accio", async () => {
-    await stopAccioProcess();
-    await launchAccioProcess();
-    const message = `Accio Work restarted in ${config.mode} mode`;
-    log("INFO", message);
-    return { restarted: true, accioRunning: true, message };
+    const message = await launchOrRestartAccio();
+    return { restarted: true, accioRunning: true, accioRoutingVerified, alibabaAccountConnected, bridgePort: config.bridgePort, message };
   });
 }
 
@@ -1025,6 +1245,7 @@ function createWindow() {
     minWidth: 1000,
     minHeight: 700,
     backgroundColor: "#fafaf8",
+    icon: path.join(__dirname, "app-icon.png"),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -1070,9 +1291,14 @@ function createWindow() {
         const report = await window.webContents.executeJavaScript(`
           (async () => {
             const result = {};
+            const snapshot = await window.accioSwitch.invoke('get_snapshot');
             const byText = (text) => [...document.querySelectorAll('button')]
               .find((button) => button.textContent.trim().includes(text));
             result.initialTitle = document.querySelector('h1')?.textContent;
+            result.baseUrl = snapshot.config?.baseUrl || "";
+            result.model = snapshot.config?.model || "";
+            result.apiKeyConfigured = Boolean(snapshot.config?.apiKeyConfigured);
+            result.imageApiKeyConfigured = Boolean(snapshot.config?.imageApiKeyConfigured);
             byText('Settings')?.click();
             await new Promise((resolve) => setTimeout(resolve, 80));
             result.settingsVisible = document.body.textContent.includes('Local service and Accio installation paths.');
@@ -1082,8 +1308,9 @@ function createWindow() {
             await new Promise((resolve) => setTimeout(resolve, 80));
             result.officialMutesCustom = document.querySelector('.custom-config')?.classList.contains('is-muted');
             byText('Custom')?.click();
-            await window.accioSwitch.invoke('start_bridge');
-            const health = await fetch('http://127.0.0.1:8787/health').then((response) => response.json());
+            const bridge = await window.accioSwitch.invoke('start_bridge');
+            result.bridgePort = bridge.bridgePort;
+            const health = await fetch('http://127.0.0.1:' + bridge.bridgePort + '/health').then((response) => response.json());
             result.bridgeHealth = health;
             await window.accioSwitch.invoke('stop_bridge');
             result.bridgeStopped = true;
@@ -1150,6 +1377,7 @@ if (!allowMultipleInstances) {
 
 app.whenReady().then(() => {
   if (!singleInstanceLock) return;
+  if (process.platform === "win32") app.setAppUserModelId("com.accioswitch.desktop");
   loadConfig();
   registerIpc();
   createWindow();

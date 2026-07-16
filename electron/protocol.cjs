@@ -281,6 +281,21 @@ function imageFrame({ data, mimeType = "image/png", text = "", model = "" }) {
   };
 }
 
+function requestedModelFromAccio(input, fallbackModel) {
+  const requested = [
+    input?.model,
+    input?.modelCode,
+    input?.model_code,
+    input?.modelName,
+    input?.model_name,
+    input?.properties?.model,
+    input?.properties?.modelCode,
+    input?.properties?.model_code,
+  ].find((value) => typeof value === "string" && value.trim());
+  const model = String(requested || "").trim();
+  return model && model.toLowerCase() !== "auto" ? model : fallbackModel;
+}
+
 function accioToOpenAI(input, model, options = {}) {
   const maxToolContentChars = options.maxToolContentChars || MAX_TOOL_CONTENT_CHARS;
   const maxTextContentChars = options.maxTextContentChars || MAX_TEXT_CONTENT_CHARS;
@@ -360,9 +375,9 @@ function accioToOpenAI(input, model, options = {}) {
     ? Math.min(requestedMaxTokens, options.maxOutputTokens)
     : requestedMaxTokens;
   return {
-    model,
+    model: requestedModelFromAccio(input, model),
     messages,
-    stream: false,
+    stream: true,
     temperature: input.temperature ?? generation.temperature ?? 0.7,
     max_tokens: maxTokens,
     ...(input.topP ?? generation.topP ? { top_p: input.topP ?? generation.topP } : {}),
@@ -583,7 +598,8 @@ function buildToolRepairRequest(request, invalidCall) {
   };
 }
 
-function sseResponse(res, status, frames) {
+function openSseResponse(res, status = 200) {
+  if (res.headersSent) return;
   res.writeHead(status, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
@@ -591,6 +607,11 @@ function sseResponse(res, status, frames) {
     "x-accel-buffering": "no",
     "access-control-allow-origin": "*",
   });
+  res.flushHeaders?.();
+}
+
+function sseResponse(res, status, frames) {
+  openSseResponse(res, status);
   for (const frame of frames) res.write(`data: ${JSON.stringify(frame)}\n\n`);
   res.end();
 }
@@ -609,7 +630,9 @@ module.exports = {
   mergeOpenAIChunks,
   normalizeTools,
   normalizeToolArguments,
+  openSseResponse,
   openAIToAccio,
   parseProviderBody,
+  requestedModelFromAccio,
   sseResponse,
 };

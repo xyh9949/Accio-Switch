@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import appIcon from "./assets/accio-switch-icon.png";
 import {
   ArrowSquareOut,
   CheckCircle,
@@ -102,7 +103,7 @@ async function invoke(command, args = {}) {
       return { currentVersion: "0.3.0", hasUpdate: false, version: "0.3.0", notes: "No update available" };
     }
     if (command === "download_update") return { downloaded: true, filePath: "C:\\Temp\\Accio-Switch-0.3.0.exe", version: "0.3.0" };
-    if (command === "start_bridge") return { running: true };
+    if (command === "start_bridge") return { running: true, bridgePort: DEFAULT_CONFIG.bridgePort };
     if (command === "stop_bridge") return { running: false };
     if (command === "get_runtime_status") return { bridgeRunning: false, accioRunning: false };
     if (command === "launch_accio") return { launched: true, accioRunning: true, message: "Accio Work launched" };
@@ -163,6 +164,8 @@ export function App() {
   const [config, setConfig] = useState(DEFAULT_CONFIG);
   const [bridgeRunning, setBridgeRunning] = useState(false);
   const [accioRunning, setAccioRunning] = useState(false);
+  const [accioRoutingVerified, setAccioRoutingVerified] = useState(false);
+  const [alibabaAccountConnected, setAlibabaAccountConnected] = useState(false);
   const [logs, setLogs] = useState(DEMO_LOGS);
   const [showKey, setShowKey] = useState(false);
   const [showImageKey, setShowImageKey] = useState(false);
@@ -192,6 +195,8 @@ export function App() {
         }
         setBridgeRunning(snapshot.bridgeRunning);
         setAccioRunning(Boolean(snapshot.accioRunning));
+        setAccioRoutingVerified(Boolean(snapshot.accioRoutingVerified));
+        setAlibabaAccountConnected(Boolean(snapshot.alibabaAccountConnected));
         if (snapshot.appVersion) setAppVersion(snapshot.appVersion);
         if (snapshot.logs?.length) setLogs(snapshot.logs.slice(-8));
         if (snapshot.config?.updateCheckOnStart && snapshot.config?.updateFeedUrl) {
@@ -212,6 +217,8 @@ export function App() {
         .then((status) => {
           setBridgeRunning(Boolean(status.bridgeRunning));
           setAccioRunning(Boolean(status.accioRunning));
+          setAccioRoutingVerified(Boolean(status.accioRoutingVerified));
+          setAlibabaAccountConnected(Boolean(status.alibabaAccountConnected));
         })
         .catch(() => {});
     };
@@ -410,7 +417,12 @@ export function App() {
       markSaved(config);
       const result = await invoke(bridgeRunning ? "stop_bridge" : "start_bridge");
       setBridgeRunning(result.running);
-      addLog(result.running ? `Bridge listening on 127.0.0.1:${config.bridgePort}` : "Bridge stopped");
+      const activePort = Number(result.bridgePort || config.bridgePort);
+      if (result.running && activePort !== config.bridgePort) {
+        setConfig(markSaved({ ...config, bridgePort: activePort }));
+        setNotice(`Port ${config.bridgePort} is occupied. Bridge switched to ${activePort}.`);
+      }
+      addLog(result.running ? `Bridge listening on 127.0.0.1:${activePort}` : "Bridge stopped");
     } catch (error) {
       setNotice(String(error));
       addLog(String(error), "ERROR");
@@ -428,6 +440,12 @@ export function App() {
       const result = await invoke(accioRunning ? "restart_accio" : "launch_accio");
       if (config.mode === "custom") setBridgeRunning(true);
       setAccioRunning(Boolean(result.accioRunning ?? true));
+      setAccioRoutingVerified(Boolean(result.accioRoutingVerified));
+      setAlibabaAccountConnected(Boolean(result.alibabaAccountConnected));
+      const activePort = Number(result.bridgePort || config.bridgePort);
+      if (config.mode === "custom" && activePort !== config.bridgePort) {
+        setConfig(markSaved({ ...config, bridgePort: activePort }));
+      }
       addLog(result.message || `Accio launched in ${config.mode} mode`);
       setNotice(result.message || "Accio Work launched");
     } catch (error) {
@@ -465,7 +483,7 @@ export function App() {
       ok: endpointConfigured && isConfigSaved,
     },
     { label: "Authentication", value: config.apiKey || config.apiKeyConfigured ? "Key configured" : "Missing key", ok: Boolean(config.apiKey || config.apiKeyConfigured) },
-    { label: "Chat model", value: config.model || "Not set", ok: Boolean(config.model) },
+    { label: "Default chat model", value: config.model || "Not set", ok: Boolean(config.model) },
     { label: "Model list", value: config.cachedModels?.length ? `${config.cachedModels.length} cached` : "Manual", ok: true },
     {
       label: "Image route",
@@ -476,13 +494,28 @@ export function App() {
         : "Disabled",
       ok: imageRouteConfigured && isConfigSaved,
     },
-    { label: "Accio Work", value: accioRunning ? "Running" : "Closed", ok: true },
+    {
+      label: "Accio Work",
+      value: !accioRunning
+        ? "Closed"
+        : config.mode === "custom"
+          ? accioRoutingVerified
+            ? "Running through proxy"
+            : "Running, proxy unverified"
+          : "Running officially",
+      ok: !accioRunning || config.mode === "official" || accioRoutingVerified,
+    },
+    {
+      label: "Alibaba.com account",
+      value: alibabaAccountConnected ? "Connected through Accio" : "Login required in Accio",
+      ok: alibabaAccountConnected,
+    },
   ];
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand-mark"><ShareNetwork size={30} weight="duotone" /></div>
+        <div className="brand-mark"><img src={appIcon} alt="Accio Switch" /></div>
         <nav>
           {[
             ["route", ShareNetwork, "Route"],
@@ -585,7 +618,7 @@ export function App() {
                         <small>The key is encrypted with Windows secure storage, never written to the config file.</small>
                       </label>
                       <label>
-                        <span>Model</span>
+                        <span>Default model</span>
                         <div className="input-wrap mono">
                           {config.cachedModels?.length ? (
                             <select value={config.model} onChange={(event) => update({ model: event.target.value })} disabled={config.mode === "official"}>
@@ -597,7 +630,7 @@ export function App() {
                             <input value={config.model} onChange={(event) => update({ model: event.target.value })} disabled={config.mode === "official"} />
                           )}
                         </div>
-                        <small>{config.modelsLastFetchedAt ? `Fetched ${config.cachedModels?.length || 0} model(s) from upstream.` : "Fetch models from NewAPI/OpenAI-compatible /models, or type manually."}</small>
+                        <small>{config.modelsLastFetchedAt ? `Fetched ${config.cachedModels?.length || 0} model(s). Accio selections are forwarded; this model is used for Auto and fallback.` : "Fetch models from upstream. Accio selections are forwarded; this model is used for Auto and fallback."}</small>
                       </label>
                     </div>
                     <div className="endpoint-actions">

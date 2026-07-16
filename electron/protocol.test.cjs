@@ -9,10 +9,72 @@ const {
   imageFrame,
   imageSizeForOpenAI,
   isImageOutputRequest,
+  openSseResponse,
   openAIToAccio,
   parseProviderBody,
+  requestedModelFromAccio,
+  sseResponse,
   toolResultContent,
 } = require("./protocol.cjs");
+const {
+  findAlibabaAuthorizationStatus,
+  findGatewayStatus,
+  forcedModelRoutingResponse,
+  isModelRoutingRequest,
+} = require("./routing.cjs");
+
+test("intercepts only RLab automatic model-routing calls", () => {
+  assert.equal(
+    isModelRoutingRequest("/api/tool/rlab/call", "POST", Buffer.from('{"function":"model_routing","payload":{}}')),
+    true,
+  );
+  assert.equal(
+    isModelRoutingRequest("/api/tool/rlab/call", "POST", Buffer.from('{"function":"other_tool"}')),
+    false,
+  );
+  assert.deepEqual(forcedModelRoutingResponse("gpt-5.5"), {
+    success: true,
+    data: {
+      payload: {
+        modelCode: "gpt-5.5",
+        shouldCompact: false,
+        reason: "accio_switch_forced",
+      },
+    },
+  });
+});
+
+test("verifies the gateway from Accio's own startup log", () => {
+  const since = 1782120000000;
+  const text = [
+    JSON.stringify({ timestamp: since - 1000, message: "[Gateway] Config: gatewayBaseUrl=https://phoenix-gw.alibaba.com" }),
+    JSON.stringify({ timestamp: since + 1000, message: "[Gateway] Config: gatewayBaseUrl=http://127.0.0.1:8787, ADK_EMPID=undefined" }),
+  ].join("\n");
+  assert.deepEqual(findGatewayStatus(text, since, "http://127.0.0.1:8787"), {
+    verified: true,
+    message: "[Gateway] Config: gatewayBaseUrl=http://127.0.0.1:8787, ADK_EMPID=undefined",
+    timestamp: since + 1000,
+  });
+});
+
+test("recognizes Alibaba official account authorization after startup preflight", () => {
+  const since = 1782120000000;
+  const text = [
+    JSON.stringify({
+      timestamp: since + 1000,
+      message: "[preflight-connector] alibaba → unauthorized (cm undefined)",
+    }),
+    JSON.stringify({
+      timestamp: since + 2000,
+      message: '[connector-debug] kind=list_response stage=success payload={"response":[{"id":"alibaba","status":"authorized","connectedCount":1}]}',
+    }),
+  ].join("\n");
+  assert.deepEqual(findAlibabaAuthorizationStatus(text, since), {
+    connected: true,
+    message: '[connector-debug] kind=list_response stage=success payload={"response":[{"id":"alibaba","status":"authorized","connectedCount":1}]}',
+    timestamp: since + 2000,
+  });
+});
 
 test("converts the current Accio proto-shaped request", () => {
   const converted = accioToOpenAI({
@@ -35,6 +97,51 @@ test("converts the current Accio proto-shaped request", () => {
   assert.equal(converted.tools[0].function.name, "search");
   assert.equal(converted.temperature, 0.2);
   assert.equal(converted.max_tokens, 512);
+  assert.equal(converted.stream, true);
+});
+
+test("opens an SSE response immediately and reuses its headers for the final frame", () => {
+  const writes = [];
+  const response = {
+    headersSent: false,
+    writeHead(status, headers) {
+      this.headersSent = true;
+      this.status = status;
+      this.headers = headers;
+    },
+    flushHeaders() {
+      this.flushed = true;
+    },
+    write(value) {
+      writes.push(value);
+    },
+    end() {
+      this.ended = true;
+    },
+  };
+
+  openSseResponse(response, 200);
+  assert.equal(response.flushed, true);
+  assert.equal(response.headers["content-type"], "text/event-stream; charset=utf-8");
+  openSseResponse(response, 502);
+  assert.equal(response.status, 200);
+  sseResponse(response, 200, [{ turnComplete: true }]);
+  assert.match(writes[0], /"turnComplete":true/);
+  assert.equal(response.ended, true);
+});
+
+test("uses the model selected in Accio and falls back for Auto", () => {
+  assert.equal(requestedModelFromAccio({ model: "gpt-5.5" }, "gpt-5.6-sol"), "gpt-5.5");
+  assert.equal(requestedModelFromAccio({ modelCode: "gpt-5.4-mini" }, "gpt-5.6-sol"), "gpt-5.4-mini");
+  assert.equal(requestedModelFromAccio({ properties: { model: "gpt-5-mini" } }, "gpt-5.6-sol"), "gpt-5-mini");
+  assert.equal(requestedModelFromAccio({ model: "auto" }, "gpt-5.6-sol"), "gpt-5.6-sol");
+  assert.equal(requestedModelFromAccio({}, "gpt-5.6-sol"), "gpt-5.6-sol");
+
+  const request = accioToOpenAI({
+    model: "gpt-5.5",
+    contents: [{ role: "user", parts: [{ text: "Hello" }] }],
+  }, "gpt-5.6-sol");
+  assert.equal(request.model, "gpt-5.5");
 });
 
 test("normalizes text and tool calls into an Accio frame", () => {
