@@ -228,7 +228,7 @@ Accio Switch 只能控制它已经识别并适配的模型、图片和 Embedding
   "version": "0.4.6",
   "channel": "stable",
   "url": "https://github.com/xyh9949/Accio-Switch/releases/download/v0.4.6/Accio-Switch-0.4.6.exe",
-  "sha256": "DC0E2C7DBD55E3C79BDE8B7377DAC1B9E15F265D6A318E8D0CC7DEE698A7D24F",
+  "sha256": "<填入发布文件的 SHA-256>",
   "notes": "Release notes",
   "mandatory": false,
   "minVersion": "0.4.0"

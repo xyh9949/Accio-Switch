@@ -1,0 +1,97 @@
+name: Build and publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish
+        required: true
+        default: v0.4.6
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build portable Windows executable
+        run: npm run electron:build
+
+      - name: Upload and publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ inputs.tag }}"
+          $repo = "${{ github.repository }}"
+
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Tag must use the vMAJOR.MINOR.PATCH format: $tag"
+          }
+
+          $version = $tag.Substring(1)
+          $packageVersion = (Get-Content -Raw package.json | ConvertFrom-Json).version
+          if ($packageVersion -ne $version) {
+            throw "Tag $tag does not match package.json version $packageVersion"
+          }
+
+          $asset = Resolve-Path "release\Accio-Switch-$version.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash
+          $size = (Get-Item $asset).Length
+
+          gh release upload $tag $asset --repo $repo --clobber
+
+          $notes = @"
+          ## 主要更新
+
+          - Accio 内明确选择的模型现在会原样转发到第三方接口，Switch 的 Default model 仅用于 Auto 和回退。
+          - 修复 Endpoint 测试长时间转圈，加入 20 秒超时。
+          - Bridge 首选端口被占用时自动寻找后续可用端口，避免 ``EADDRINUSE``。
+          - 为长时间 LLM 请求加入 SSE 心跳，并继续优化大上下文压缩与临时上游错误重试。
+          - 增加自定义 Embedding 路由、Accio 实际网关验证和 Alibaba.com 官方账号授权状态显示。
+          - 图片 Base URL、API Key、模型和协议继续保持独立，支持 Chat Completions 多模态和 OpenAI Images API。
+          - 统一应用、任务栏和托盘图标，保留单实例与最小化到托盘体验。
+          - 补充完整中文 README、当前界面图、MIT License 和公开仓库安全说明。
+
+          ## 兼容性
+
+          - 当前主要适配 Accio Work 0.16.1。
+          - Accio 使用未公开的内部协议，后续桌面端升级可能需要重新适配。
+          - Alibaba.com 账号授权、经营数据工具和其他非模型 API 仍使用官方服务；是否消耗 i豆由官方规则决定。
+
+          ## 下载校验
+
+          - 文件：``Accio-Switch-$version.exe``
+          - 大小：``$size bytes``
+          - SHA-256：``$hash``
+
+          完整使用方法与安全边界请阅读仓库 README。
+          "@
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          $notes | Set-Content -Path $notesPath -Encoding utf8
+
+          gh release edit $tag --repo $repo --title "Accio Switch $version" --notes-file $notesPath --draft=false --latest
